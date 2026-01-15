@@ -19,6 +19,7 @@
 - **Heartbeat** - автоматическое продление TTL блокировки
 - **Fencing Tokens** - защита от race conditions при GC паузах
 - **Атомарные операции** - все критичные операции через Lua скрипты
+- **Гибкие стратегии ожидания** - polling с exponential backoff или BLPOP для эффективного ожидания
 - **Docker для Redis** - готовый контейнер для локальной разработки
 
 ## Установка
@@ -151,6 +152,11 @@ with Semaphore(client, sem_cfg) as sem:
 | `namespace` | str | "semaphore" | Префикс Redis-ключей для изоляции окружений/сервисов. |
 | `strict_mode` | bool | False | Если `True`, при потере слота сразу кидает `LockLostError`. |
 | `use_server_time` | bool | False | Если `True`, время берется с Redis (`TIME`). Полезно при рассинхронизации часов между машинами: TTL и очистка просроченных слотов будут согласованы. Минус — один дополнительный сетевой RTT на операции времени. Стоит включать `use_server_time`, если у вас несколько инстансов на разных хостах и нет гарантии синхронизации времени или вы видите преждевременные таймауты или "зависшие" слоты из-за скью часов.|
+| `acquire_mode` | AcquireMode | BLPOP | Стратегия ожидания: `POLLING` (retry loop) или `BLPOP` (эффективное блокирующее ожидание через Redis). |
+| `retry_interval_max` | float | None | Макс. интервал для exponential backoff. `None` — без backoff. |
+| `retry_backoff_multiplier` | float | 2.0 | Множитель для exponential backoff. |
+| `retry_jitter` | float | 0.0 | Случайный jitter как доля интервала (0.0-1.0). Помогает избежать thundering herd. |
+| `blpop_timeout` | float | 5.0 | Таймаут BLPOP перед fallback retry (только для `BLPOP` режима). |
 
 
 
@@ -250,6 +256,68 @@ else:
 
 `acquire` делает одну попытку и сразу возвращает результат.
 Если слот занят, код не ждет и сразу переходит в ветку `else`.
+
+
+### Стратегии ожидания (AcquireMode)
+
+При `blocking=True` семафор ждёт освобождения слота. Есть две стратегии:
+
+#### BLPOP (по умолчанию)
+
+Использует Redis `BLPOP` для блокирующего ожидания уведомления.
+При `release()` публикуется сигнал, пробуждающий ожидающего клиента.
+
+```python
+from redis_semaphore import Semaphore, SemaphoreConfig
+
+# BLPOP используется по умолчанию
+config = SemaphoreConfig(
+    name="jobs",
+    limit=5,
+    blpop_timeout=5.0,  # fallback polling каждые 5 сек
+)
+```
+
+**Преимущества BLPOP:**
+- Минимальная нагрузка на Redis (нет постоянных запросов)
+- Мгновенное пробуждение при освобождении слота
+- Честная очередь (FIFO) — кто первый начал ждать, тот первый получит
+
+#### POLLING
+
+Простой retry loop с паузой `retry_interval` между попытками.
+
+```python
+from redis_semaphore import Semaphore, SemaphoreConfig, AcquireMode
+
+config = SemaphoreConfig(
+    name="jobs",
+    limit=5,
+    acquire_mode=AcquireMode.POLLING,
+    retry_interval=0.1,  # проверять каждые 100ms
+)
+```
+
+**С exponential backoff и jitter:**
+
+```python
+config = SemaphoreConfig(
+    name="jobs",
+    limit=5,
+    acquire_mode=AcquireMode.POLLING,
+    retry_interval=0.1,         # начальный интервал
+    retry_interval_max=2.0,     # максимальный интервал
+    retry_backoff_multiplier=2.0,  # удваиваем каждый цикл
+    retry_jitter=0.1,           # ±10% случайный jitter
+)
+```
+
+Backoff полезен для снижения нагрузки на Redis при длительном ожидании.
+Jitter помогает избежать thundering herd, когда много клиентов ждут одновременно.
+
+**Когда выбирать POLLING:**
+- Простые случаи с коротким ожиданием
+- Совместимость со старыми версиями Redis
 
 
 ### Обработка потери блокировки

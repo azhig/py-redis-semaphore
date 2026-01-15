@@ -127,3 +127,94 @@ async def test_async_context_manager_acquire_failure(async_redis_client):
     sem = FailingSemaphore(async_redis_client, config)
     with pytest.raises(AcquireError):
         await sem.__aenter__()
+
+
+@pytest.mark.asyncio
+async def test_async_blpop_acquire_release(async_redis_client):
+    """Test async BLPOP mode acquire/release."""
+    from redis_semaphore import AcquireMode
+
+    config = SemaphoreConfig(
+        name="test-async-blpop",
+        limit=1,
+        acquire_mode=AcquireMode.BLPOP,
+        blpop_timeout=1.0,
+    )
+
+    sem = Semaphore(async_redis_client, config)
+    result = await sem.aacquire(blocking=False)
+    assert result.success is True
+    await sem.arelease()
+
+
+@pytest.mark.asyncio
+async def test_async_blpop_waiter_notification(async_redis_client):
+    """Test that async release notifies waiting BLPOP."""
+    import asyncio
+
+    from redis_semaphore import AcquireMode
+
+    config = SemaphoreConfig(
+        name="test-async-blpop-notify",
+        limit=1,
+        acquire_mode=AcquireMode.BLPOP,
+        blpop_timeout=5.0,
+    )
+
+    sem1 = Semaphore(async_redis_client, config)
+    await sem1.aacquire(blocking=False)
+
+    acquired = asyncio.Event()
+
+    async def waiter():
+        sem2 = Semaphore(async_redis_client, config)
+        await sem2.aacquire(blocking=True)
+        acquired.set()
+        await sem2.arelease()
+
+    task = asyncio.create_task(waiter())
+
+    # Give task time to start waiting
+    await asyncio.sleep(0.1)
+
+    # Release should notify the waiter
+    await sem1.arelease()
+
+    # Wait for waiter to acquire
+    try:
+        await asyncio.wait_for(acquired.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        pytest.fail("Waiter did not acquire in time")
+
+    await task
+
+
+@pytest.mark.asyncio
+async def test_async_polling_with_backoff(async_redis_client):
+    """Test async polling with exponential backoff."""
+    import time
+
+    from redis_semaphore import AcquireMode
+
+    config = SemaphoreConfig(
+        name="test-async-polling-backoff",
+        limit=1,
+        acquire_mode=AcquireMode.POLLING,
+        retry_interval=0.05,
+        retry_interval_max=0.2,
+        retry_backoff_multiplier=2.0,
+        acquire_timeout=0.5,
+    )
+
+    sem1 = Semaphore(async_redis_client, config)
+    await sem1.aacquire(blocking=False)
+
+    sem2 = Semaphore(async_redis_client, config)
+    start = time.monotonic()
+    with pytest.raises(AcquireTimeoutError):
+        await sem2.aacquire(blocking=True)
+    elapsed = time.monotonic() - start
+
+    assert 0.4 < elapsed < 0.7
+
+    await sem1.arelease()
