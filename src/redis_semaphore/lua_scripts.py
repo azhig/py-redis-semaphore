@@ -362,7 +362,7 @@ class LuaScriptRunner:
 
 
 def _parse_acquire_result(result: object) -> tuple[bool, int | None, int | None]:
-    if not isinstance(result, (list, tuple)) or len(result) != 3:
+    if not isinstance(result, list | tuple) or len(result) != 3:
         raise ValueError("Unexpected acquire result shape")
 
     success_raw, fencing_raw, expires_raw = result
@@ -374,7 +374,7 @@ def _parse_acquire_result(result: object) -> tuple[bool, int | None, int | None]
 
 
 def _parse_status_result(result: object) -> tuple[int, bool, int | None]:
-    if not isinstance(result, (list, tuple)) or len(result) != 3:
+    if not isinstance(result, list | tuple) or len(result) != 3:
         raise ValueError("Unexpected status result shape")
 
     count_raw, is_owner_raw, expires_raw = result
@@ -387,7 +387,7 @@ def _parse_status_result(result: object) -> tuple[int, bool, int | None]:
 def _to_optional_int(value: object) -> int | None:
     if value in (None, "", b""):
         return None
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         if len(value) == 0:
             return None  # pragma: no cover - handled by empty-bytes fast path
         return int(bytes(value))
@@ -403,7 +403,7 @@ def _to_optional_int(value: object) -> int | None:
 
 
 def _to_bool(value: object) -> bool:
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         if len(value) == 0:
             return False
         return bool(int(bytes(value)))
@@ -415,7 +415,7 @@ def _to_bool(value: object) -> bool:
 
 
 def _to_int(value: object) -> int:
-    if isinstance(value, (bytes, bytearray, memoryview)):
+    if isinstance(value, bytes | bytearray | memoryview):
         if len(value) == 0:
             return 0
         return int(bytes(value))
