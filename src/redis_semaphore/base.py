@@ -69,6 +69,11 @@ class BaseSemaphoreCommon(Generic[ClientT]):
         return f"{self._config.namespace}:{self._config.name}:fencing"
 
     @property
+    def queue_key(self) -> str:
+        """Redis key for the notification queue (used in BLPOP mode)."""
+        return f"{self._config.namespace}:{self._config.name}:queue"
+
+    @property
     def identifier(self) -> str | None:
         """Unique identifier of the current owner."""
         return self._identifier

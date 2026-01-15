@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+import random
 import sys
 import threading
 import time
@@ -33,7 +34,7 @@ from .heartbeat import Heartbeat
 from .logger import logger
 from .lua_scripts import LuaScriptRunner, ScriptClientAdapter
 from .metrics import get_metrics
-from .types import AcquireResult, LockState, SemaphoreConfig
+from .types import AcquireMode, AcquireResult, LockState, SemaphoreConfig
 
 # Type alias for lock lost callback
 # Supports both sync and async callbacks
@@ -389,6 +390,83 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         elapsed = time.monotonic() - state.start_time
         return elapsed >= self._config.acquire_timeout
 
+    def _calculate_retry_interval(self, state: _AcquireState) -> float:
+        """Calculate retry interval with optional exponential backoff and jitter.
+
+        Args:
+            state: Current acquire state with timing information.
+
+        Returns:
+            Sleep interval in seconds.
+        """
+        base = self._config.retry_interval
+
+        # Apply exponential backoff if max interval is configured
+        if self._config.retry_interval_max is not None:
+            elapsed = time.monotonic() - state.start_time
+            # Calculate number of retry cycles elapsed
+            cycles = elapsed / base
+            multiplier = self._config.retry_backoff_multiplier**cycles
+            interval = min(base * multiplier, self._config.retry_interval_max)
+        else:
+            interval = base
+
+        # Apply jitter as a fraction of the current interval
+        if self._config.retry_jitter > 0:
+            jitter = random.uniform(0, self._config.retry_jitter * interval)
+            interval += jitter
+
+        return interval
+
+    def _wait_polling(self, state: _AcquireState) -> None:
+        """Wait using polling strategy with optional backoff/jitter."""
+        interval = self._calculate_retry_interval(state)
+        time.sleep(interval)
+
+    def _wait_blpop(self) -> None:
+        """Wait using BLPOP for notification with fallback timeout."""
+        # BLPOP returns None on timeout, (key, value) on success
+        # We don't care about the value, just the wakeup signal
+        self._client.blpop([self.queue_key], timeout=self._config.blpop_timeout)
+
+    async def _wait_polling_async(self, state: _AcquireState) -> None:
+        """Async wait using polling strategy with optional backoff/jitter."""
+        interval = self._calculate_retry_interval(state)
+        await asyncio.sleep(interval)
+
+    async def _wait_blpop_async(self) -> None:
+        """Async wait using BLPOP for notification with fallback timeout."""
+        await self._client.blpop([self.queue_key], timeout=self._config.blpop_timeout)  # type: ignore[misc]
+
+    def _wait_for_slot(self, state: _AcquireState) -> None:
+        """Wait for a slot using the configured strategy."""
+        if self._config.acquire_mode == AcquireMode.BLPOP:
+            self._wait_blpop()
+        else:
+            self._wait_polling(state)
+
+    async def _wait_for_slot_async(self, state: _AcquireState) -> None:
+        """Async wait for a slot using the configured strategy."""
+        if self._config.acquire_mode == AcquireMode.BLPOP:
+            await self._wait_blpop_async()
+        else:
+            await self._wait_polling_async(state)
+
+    def _notify_waiters(self) -> None:
+        """Notify one waiter that a slot is available via LPUSH."""
+        try:
+            self._client.lpush(self.queue_key, "1")
+        except Exception:
+            # Non-critical: if notify fails, waiters will retry on timeout
+            logger.debug("Failed to notify waiters", exc_info=True)
+
+    async def _notify_waiters_async(self) -> None:
+        """Async notify one waiter that a slot is available via LPUSH."""
+        try:
+            await self._client.lpush(self.queue_key, "1")  # type: ignore[misc]
+        except Exception:
+            logger.debug("Failed to notify waiters", exc_info=True)
+
     def acquire(self, blocking: bool = True) -> AcquireResult:
         """Acquire a semaphore slot.
 
@@ -462,7 +540,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             if self._check_timeout(state):
                 self._handle_timeout(state)
 
-            time.sleep(self._config.retry_interval)
+            self._wait_for_slot(state)
 
     async def aacquire(self, blocking: bool = True) -> AcquireResult:
         """Asynchronously acquire a semaphore slot.
@@ -532,7 +610,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             if self._check_timeout(state):
                 self._handle_timeout(state)
 
-            await asyncio.sleep(self._config.retry_interval)
+            await self._wait_for_slot_async(state)
 
     def release(self) -> bool:
         """Release the semaphore slot.
@@ -562,6 +640,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         )
 
         if released:
+            self._notify_waiters()
             self._reset_state()
 
         return released
@@ -591,6 +670,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         )
 
         if released:
+            await self._notify_waiters_async()
             self._reset_state()
 
         return released

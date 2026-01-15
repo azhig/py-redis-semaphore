@@ -323,3 +323,204 @@ class TestSemaphoreContextErrors:
         sem = FailingSemaphore(redis_client, config)
         with pytest.raises(AcquireError):
             sem.__enter__()
+
+
+class TestAcquireModePolling:
+    """Tests for polling mode with backoff and jitter."""
+
+    def test_polling_default_behavior(self, redis_client):
+        """Test default polling behavior (no backoff)."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-polling-default",
+            limit=1,
+            acquire_mode=AcquireMode.POLLING,
+            retry_interval=0.1,
+        )
+
+        sem = Semaphore(redis_client, config)
+        result = sem.acquire(blocking=False)
+        assert result.success is True
+        sem.release()
+
+    def test_polling_with_backoff(self, redis_client):
+        """Test polling with exponential backoff."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-polling-backoff",
+            limit=1,
+            acquire_mode=AcquireMode.POLLING,
+            retry_interval=0.05,
+            retry_interval_max=0.2,
+            retry_backoff_multiplier=2.0,
+            acquire_timeout=0.5,
+        )
+
+        # Hold the lock
+        sem1 = Semaphore(redis_client, config)
+        sem1.acquire(blocking=False)
+
+        # Try to acquire with backoff
+        sem2 = Semaphore(redis_client, config)
+        start = time.monotonic()
+        with pytest.raises(AcquireTimeoutError):
+            sem2.acquire(blocking=True)
+        elapsed = time.monotonic() - start
+
+        # Should have timed out around 0.5s
+        assert 0.4 < elapsed < 0.7
+
+        sem1.release()
+
+    def test_polling_with_jitter(self, redis_client):
+        """Test polling with jitter doesn't fail."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-polling-jitter",
+            limit=1,
+            acquire_mode=AcquireMode.POLLING,
+            retry_interval=0.05,
+            retry_jitter=0.5,
+        )
+
+        sem = Semaphore(redis_client, config)
+        result = sem.acquire(blocking=False)
+        assert result.success is True
+        sem.release()
+
+
+class TestAcquireModeBLPOP:
+    """Tests for BLPOP mode."""
+
+    def test_blpop_acquire_release(self, redis_client):
+        """Test basic acquire/release with BLPOP mode."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-blpop-basic",
+            limit=1,
+            acquire_mode=AcquireMode.BLPOP,
+            blpop_timeout=1.0,
+        )
+
+        sem = Semaphore(redis_client, config)
+        result = sem.acquire(blocking=False)
+        assert result.success is True
+        sem.release()
+
+    def test_blpop_waiter_notification(self, redis_client):
+        """Test that release notifies waiting BLPOP."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-blpop-notify",
+            limit=1,
+            acquire_mode=AcquireMode.BLPOP,
+            blpop_timeout=5.0,
+        )
+
+        acquired_event = threading.Event()
+        released = threading.Event()
+
+        sem1 = Semaphore(redis_client, config)
+        sem1.acquire(blocking=False)
+
+        def waiter():
+            sem2 = Semaphore(redis_client, config)
+            sem2.acquire(blocking=True)  # Will wait for release
+            acquired_event.set()
+            sem2.release()
+            released.set()
+
+        t = threading.Thread(target=waiter)
+        t.start()
+
+        # Give thread time to start waiting
+        time.sleep(0.1)
+
+        # Release should notify the waiter
+        sem1.release()
+
+        # Waiter should acquire quickly after notification
+        assert acquired_event.wait(timeout=1.0), "Waiter did not acquire in time"
+        assert released.wait(timeout=1.0)
+        t.join()
+
+    def test_blpop_fallback_timeout(self, redis_client):
+        """Test BLPOP fallback polling on timeout."""
+        from redis_semaphore import AcquireMode
+
+        config = SemaphoreConfig(
+            name="test-blpop-fallback",
+            limit=1,
+            acquire_mode=AcquireMode.BLPOP,
+            blpop_timeout=0.2,  # Short timeout for fallback
+            acquire_timeout=0.5,
+        )
+
+        # Hold the lock
+        sem1 = Semaphore(redis_client, config)
+        sem1.acquire(blocking=False)
+
+        # Try to acquire - should fallback after blpop_timeout
+        sem2 = Semaphore(redis_client, config)
+        start = time.monotonic()
+        with pytest.raises(AcquireTimeoutError):
+            sem2.acquire(blocking=True)
+        elapsed = time.monotonic() - start
+
+        # Should have timed out
+        assert 0.4 < elapsed < 0.7
+
+        sem1.release()
+
+
+class TestConfigValidation:
+    """Tests for new config field validation."""
+
+    def test_retry_interval_max_validation(self):
+        """Test retry_interval_max must be >= retry_interval."""
+        with pytest.raises(ValueError, match="retry_interval_max"):
+            SemaphoreConfig(
+                name="test",
+                limit=1,
+                retry_interval=0.5,
+                retry_interval_max=0.1,  # Less than retry_interval
+            )
+
+    def test_retry_backoff_multiplier_validation(self):
+        """Test retry_backoff_multiplier must be >= 1.0."""
+        with pytest.raises(ValueError, match="retry_backoff_multiplier"):
+            SemaphoreConfig(
+                name="test",
+                limit=1,
+                retry_backoff_multiplier=0.5,  # Less than 1.0
+            )
+
+    def test_retry_jitter_validation(self):
+        """Test retry_jitter must be between 0.0 and 1.0."""
+        with pytest.raises(ValueError, match="retry_jitter"):
+            SemaphoreConfig(
+                name="test",
+                limit=1,
+                retry_jitter=1.5,  # Greater than 1.0
+            )
+
+        with pytest.raises(ValueError, match="retry_jitter"):
+            SemaphoreConfig(
+                name="test",
+                limit=1,
+                retry_jitter=-0.1,  # Less than 0.0
+            )
+
+    def test_blpop_timeout_validation(self):
+        """Test blpop_timeout must be > 0."""
+        with pytest.raises(ValueError, match="blpop_timeout"):
+            SemaphoreConfig(
+                name="test",
+                limit=1,
+                blpop_timeout=0,
+            )

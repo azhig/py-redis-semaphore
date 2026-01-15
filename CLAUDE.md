@@ -60,13 +60,14 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 | `heartbeat.py` | `SyncHeartbeat` (thread) and `AsyncHeartbeat` (task) for TTL refresh |
 | `base.py` | `BaseSemaphore` ABC with shared logic |
 | `connection.py` | `RedisConnectionFactory` for Redis and Sentinel connections |
-| `types.py` | Dataclasses: `SemaphoreConfig`, `AcquireResult`, `LockState` |
+| `types.py` | Dataclasses: `SemaphoreConfig`, `AcquireResult`, `LockState`, `AcquireMode` |
 | `errors.py` | Exception hierarchy rooted at `RedisSemaphoreError` |
 
 ### Redis Data Structures
 
 - `{namespace}:{name}:owners` - Sorted Set (member=identifier, score=expires_at_ms)
 - `{namespace}:{name}:fencing` - String (monotonic counter for fencing tokens)
+- `{namespace}:{name}:queue` - List (for BLPOP notifications in BLPOP mode)
 
 ### Key Concepts
 
@@ -78,6 +79,10 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 
 **Dual API**: Same `Semaphore`/`Mutex` class works with both sync (`acquire`/`release`) and async (`aacquire`/`arelease`). Do not mix modes on same instance.
 
+**Wait Strategies**: Two modes via `acquire_mode`:
+- `POLLING` (default): Retry loop with configurable exponential backoff and jitter
+- `BLPOP`: Efficient blocking wait via Redis BLPOP with FIFO ordering
+
 ## File Modification Guide
 
 | Task | Files to modify |
@@ -86,6 +91,7 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 | Change acquire/release logic | `semaphore.py`, `lua_scripts.py` |
 | New error type | `errors.py`, `__init__.py` |
 | New config option | `types.py`, `__init__.py` |
+| Change wait strategy | `semaphore.py` (wait methods), `types.py` (config) |
 | Sentinel changes | `connection.py` |
 | Metrics | `metrics.py` |
 | Logging | `logger.py` |

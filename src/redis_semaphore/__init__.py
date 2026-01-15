@@ -67,6 +67,7 @@ from .logger import logger, set_logger
 from .metrics import PrometheusMetrics, set_metrics
 from .semaphore import LockLostCallback, Mutex, Semaphore
 from .types import (
+    AcquireMode,
     AcquireResult,
     LockState,
     SemaphoreConfig,
@@ -76,6 +77,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     # Config types
+    "AcquireMode",
     "AcquireResult",
     "LockState",
     "RedisConfig",
