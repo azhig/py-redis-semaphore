@@ -19,6 +19,8 @@ class MetricsCollector(Protocol):
 
     def inc_acquire(self, name: str, namespace: str, result: str) -> None: ...
 
+    def inc_queue_total(self, name: str, namespace: str) -> None: ...
+
     def inc_lock_lost(self, name: str, namespace: str) -> None: ...
 
 
@@ -39,6 +41,9 @@ class _NoopMetrics:
         return None
 
     def inc_acquire(self, name: str, namespace: str, result: str) -> None:
+        return None
+
+    def inc_queue_total(self, name: str, namespace: str) -> None:
         return None
 
     def inc_lock_lost(self, name: str, namespace: str) -> None:
@@ -98,9 +103,15 @@ class PrometheusMetrics:
             ["name", "namespace", "result"],
             registry=registry,
         )
+        self._queue_total = Counter(
+            "redis_semaphore_queue_total",
+            "Total number of candidates that entered the wait queue",
+            ["name", "namespace"],
+            registry=registry,
+        )
         self._wait_seconds = Histogram(
-            "redis_semaphore_wait_seconds",
-            "Time spent waiting to acquire",
+            "redis_semaphore_queue_wait_seconds",
+            "Time spent waiting in the acquire queue",
             ["name", "namespace", "result"],
             buckets=buckets,
             registry=registry,
@@ -131,6 +142,9 @@ class PrometheusMetrics:
 
     def inc_acquire(self, name: str, namespace: str, result: str) -> None:
         self._acquire_total.labels(name=name, namespace=namespace, result=result).inc()
+
+    def inc_queue_total(self, name: str, namespace: str) -> None:
+        self._queue_total.labels(name=name, namespace=namespace).inc()
 
     def inc_lock_lost(self, name: str, namespace: str) -> None:
         self._lock_lost.labels(name=name, namespace=namespace).inc()
