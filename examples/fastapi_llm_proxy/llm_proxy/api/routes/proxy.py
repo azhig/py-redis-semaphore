@@ -29,8 +29,7 @@ async def proxy_passthrough(request: Request, full_path: str) -> Response:
     http_client: httpx.AsyncClient = request.app.state.http
 
     upstream_url = build_upstream_url(settings.upstream_base_url, request)
-    api_key = request.headers.get("x-api-key")
-    upstream_headers = build_upstream_headers(dict(request.headers), api_key)
+    upstream_headers = build_upstream_headers(dict(request.headers))
 
     body = await request.body()
     request_kwargs: dict[str, Any] = {"headers": upstream_headers}

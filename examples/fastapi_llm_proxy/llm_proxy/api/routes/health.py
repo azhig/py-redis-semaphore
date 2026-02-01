@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
@@ -17,7 +19,9 @@ async def health(request: Request) -> Response:
     """Check Redis connectivity."""
     redis_client: aioredis.Redis = request.app.state.redis
     try:
-        await redis_client.ping()
+        ping_result = redis_client.ping()
+        if asyncio.iscoroutine(ping_result):
+            await ping_result
     except Exception:
         return service_unavailable("Redis unavailable", "redis_unavailable")
     return JSONResponse(status_code=200, content={"status": "ok"})

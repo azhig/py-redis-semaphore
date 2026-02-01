@@ -1,4 +1,4 @@
-"""Semaphore pool manager for per-department and per-model limits."""
+"""Semaphore pool manager for per-client and per-model limits."""
 
 from __future__ import annotations
 
@@ -12,20 +12,27 @@ from redis_semaphore.types import AcquireMode
 
 @dataclass(frozen=True)
 class SemaphoreKey:
-    department: int
+    client_id: str
     model: str
 
     @property
     def name(self) -> str:
-        return f"dept_{self.department}:{self.model}"
+        return f"client_{self.client_id}:{self.model}"
 
 
 class SemaphorePool:
-    """Cache of semaphore configs keyed by department+model."""
+    """Cache of semaphore configs keyed by client+model."""
 
-    def __init__(self, redis_client, settings) -> None:
+    def __init__(
+        self,
+        redis_client,
+        settings,
+        *,
+        capacity_overrides: dict[str, int] | None = None,
+    ) -> None:
         self._redis = redis_client
         self._capacity = settings.semaphore_capacity
+        self._capacity_overrides = capacity_overrides or {}
         self._lock_timeout = settings.semaphore_lock_timeout
         self._acquire_timeout = settings.semaphore_acquire_timeout
         self._namespace = settings.semaphore_namespace
@@ -35,14 +42,15 @@ class SemaphorePool:
     def pool_size(self) -> int:
         return len(self._configs)
 
-    async def get_semaphore(self, department: int, model: str) -> Semaphore:
-        key = SemaphoreKey(department=department, model=model).name
+    async def get_semaphore(self, client_id: str, model: str) -> Semaphore:
+        key = SemaphoreKey(client_id=client_id, model=model).name
         if key not in self._configs:
             async with self._lock:
                 if key not in self._configs:
+                    limit = self._capacity_overrides.get(key, self._capacity)
                     self._configs[key] = SemaphoreConfig(
                         name=key,
-                        limit=self._capacity,
+                        limit=limit,
                         lock_timeout=self._lock_timeout,
                         acquire_timeout=self._acquire_timeout,
                         namespace=self._namespace,
@@ -55,9 +63,10 @@ class SemaphorePool:
         if key not in self._configs:
             async with self._lock:
                 if key not in self._configs:
+                    limit = self._capacity_overrides.get(key, self._capacity)
                     self._configs[key] = SemaphoreConfig(
                         name=key,
-                        limit=self._capacity,
+                        limit=limit,
                         lock_timeout=self._lock_timeout,
                         acquire_timeout=self._acquire_timeout,
                         namespace=self._namespace,

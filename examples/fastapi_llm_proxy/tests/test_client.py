@@ -52,9 +52,9 @@ async def _run_one(
 
 async def run_test(args: argparse.Namespace) -> None:
     url = args.url.rstrip("/")
-    headers = {"direction": str(args.direction)}
+    headers = {"x-client-id": args.client_id}
     if args.api_key:
-        headers["x-api-key"] = args.api_key
+        headers["authorization"] = f"Bearer {args.api_key}"
 
     payload = {
         "model": args.model,
@@ -76,9 +76,21 @@ async def run_test(args: argparse.Namespace) -> None:
                 stream=args.stream,
                 timeout=args.timeout,
             )
+            if result.status == "error":
+                print(f"Request #{index + 1} failed in {result.duration:.3f}s: {result.error}")
+            else:
+                print(
+                    f"Request #{index + 1} completed in {result.duration:.3f}s "
+                    f"(status={result.status})"
+                )
             results.append(result)
 
-        await asyncio.gather(*(runner(i) for i in range(args.requests)))
+        tasks: list[asyncio.Task[None]] = []
+        for i in range(args.requests):
+            tasks.append(asyncio.create_task(runner(i)))
+            await asyncio.sleep(0.1)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     durations = [r.duration for r in results]
     status_counts: dict[str, int] = {}
@@ -86,7 +98,7 @@ async def run_test(args: argparse.Namespace) -> None:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
 
     print("Results:")
-    print(f"  group: direction={args.direction}, model={args.model}")
+    print(f"  group: client_id={args.client_id}, model={args.model}")
     for status, count in sorted(status_counts.items()):
         print(f"  {status}: {count}")
 
@@ -107,13 +119,17 @@ async def run_test(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load test the LLM proxy")
     parser.add_argument("--url", default="http://localhost:8000", help="Proxy base URL")
-    parser.add_argument("--direction", type=int, default=1, help="department header")
+    parser.add_argument("--client-id", default="client-1", help="client id header")
     parser.add_argument("--model", default="mock-1", help="model name")
     parser.add_argument("--requests", type=int, default=10, help="total requests")
     parser.add_argument("--sleep", type=float, default=0.0, help="upstream sleep seconds")
     parser.add_argument("--stream", action="store_true", help="use streaming")
     parser.add_argument("--timeout", type=float, default=120.0, help="per-request timeout")
-    parser.add_argument("--api-key", default="", help="optional x-api-key")
+    parser.add_argument(
+        "--api-key",
+        default="",
+        help="optional upstream API key (Authorization: Bearer)",
+    )
     return parser.parse_args()
 
 

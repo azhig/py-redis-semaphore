@@ -1,11 +1,10 @@
 """Infrastructure layer for external services."""
 
 from llm_proxy.infrastructure.redis_manager import (
-    cleanup_expired_semaphores,
     close_redis,
     mark_redis_unavailable,
     redis_is_available,
-    redis_watchdog,
+    wait_for_redis,
 )
 from llm_proxy.infrastructure.upstream import (
     build_upstream_headers,
@@ -14,11 +13,10 @@ from llm_proxy.infrastructure.upstream import (
 )
 
 __all__ = [
-    "cleanup_expired_semaphores",
     "close_redis",
     "mark_redis_unavailable",
     "redis_is_available",
-    "redis_watchdog",
+    "wait_for_redis",
     "build_upstream_headers",
     "build_upstream_url",
     "filter_response_headers",

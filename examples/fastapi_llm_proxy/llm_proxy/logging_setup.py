@@ -1,87 +1,84 @@
-"""Loguru setup and stdlib logging interception."""
+"""Structlog setup and stdlib logging integration."""
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
-from loguru import logger as loguru_logger
-
+import structlog
 from redis_semaphore.logger import set_logger as set_semaphore_logger
+from structlog.types import Processor
 
 
-class _InterceptHandler(logging.Handler):
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            level = loguru_logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
+class _LoggerProxy:
+    def __init__(self, name: str) -> None:
+        self._name = name
 
-        frame = logging.currentframe()
-        depth = 2
-        while frame and frame.f_code.co_filename == logging.__file__:
-            frame = frame.f_back
-            depth += 1
+    def _logger(self):
+        return structlog.get_logger(self._name)
 
-        loguru_logger.bind(source=record.name).opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
+    def bind(self, **kwargs):
+        return self._logger().bind(**kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._logger(), name)
 
 
-class LoguruAdapter:
-    def __init__(self, logger_instance, source: str | None = None) -> None:
-        if source is None:
-            self._logger = logger_instance
-        else:
-            self._logger = logger_instance.bind(source=source)
-
-    def _log(self, level: str, msg: str, *args, **kwargs) -> None:
-        kwargs.pop("extra", None)
-        exc_info = kwargs.pop("exc_info", None)
-        if args:
-            msg = msg % args
-        if exc_info:
-            self._logger.opt(exception=True).log(level, msg)
-        else:
-            self._logger.log(level, msg)
-
-    def debug(self, msg: str, *args, **kwargs) -> None:
-        self._log("DEBUG", msg, *args, **kwargs)
-
-    def info(self, msg: str, *args, **kwargs) -> None:
-        self._log("INFO", msg, *args, **kwargs)
-
-    def warning(self, msg: str, *args, **kwargs) -> None:
-        self._log("WARNING", msg, *args, **kwargs)
-
-    def error(self, msg: str, *args, **kwargs) -> None:
-        self._log("ERROR", msg, *args, **kwargs)
-
-    def exception(self, msg: str, *args, **kwargs) -> None:
-        self._log("ERROR", msg, *args, **kwargs, exc_info=True)
+logger = _LoggerProxy("app")
 
 
-logger = loguru_logger.bind(source="app")
+def configure_logging(level: str, log_file: str | None = None) -> None:
+    timestamper = structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S.%f")
+    pre_chain: list[Processor] = [
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        timestamper,
+    ]
 
-
-def configure_logging(level: str) -> None:
-    loguru_logger.configure(extra={"source": "app"})
-    loguru_logger.remove()
-    loguru_logger.add(
-        sys.stdout,
-        level=level,
-        backtrace=True,
-        diagnose=False,
-        colorize=True,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level}</level> | "
-        "<cyan>{extra[source]}</cyan> | "
-        "<level>{message}</level>",
+    console_formatter = structlog.stdlib.ProcessorFormatter(
+        processor=structlog.dev.ConsoleRenderer(colors=True),
+        foreign_pre_chain=pre_chain,
     )
 
-    logging.basicConfig(handlers=[_InterceptHandler()], level=level, force=True)
+    handlers: list[logging.Handler] = []
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(console_formatter)
+    handlers.append(console_handler)
+
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_formatter = structlog.stdlib.ProcessorFormatter(
+            processor=structlog.processors.JSONRenderer(),
+            foreign_pre_chain=pre_chain,
+        )
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(file_formatter)
+        handlers.append(file_handler)
+
+    logging.basicConfig(handlers=handlers, level=level, force=True)
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            timestamper,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-        logging.getLogger(name).handlers = [_InterceptHandler()]
+        logging.getLogger(name).handlers = handlers
         logging.getLogger(name).propagate = False
 
-    set_semaphore_logger(LoguruAdapter(loguru_logger, source="redis_semaphore"))
+    set_semaphore_logger(structlog.get_logger("redis_semaphore"))

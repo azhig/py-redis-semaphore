@@ -34,17 +34,20 @@ def build_upstream_url(base_url: str, request: Request) -> str:
     )
 
 
-def build_upstream_headers(headers: dict[str, str], api_key: str | None) -> dict[str, str]:
-    filtered: dict[str, str] = {}
-    for key, value in headers.items():
-        lowered = key.lower()
-        if lowered in {"host", "content-length", "direction", "x-api-key"}:
-            continue
-        filtered[key] = value
-    if api_key:
-        filtered["authorization"] = f"Bearer {api_key}"
-        filtered["x-api-key"] = api_key
-    return filtered
+def build_upstream_headers(headers: dict[str, str]) -> dict[str, str]:
+    hop_by_hop = {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+    return {key: value for key, value in headers.items() if key.lower() not in hop_by_hop}
 
 
 def filter_response_headers(headers: httpx.Headers) -> dict[str, str]:
