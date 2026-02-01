@@ -33,6 +33,9 @@ class DummyMetrics:
     def inc_acquire(self, name: str, namespace: str, result: str) -> None:
         self.events.append(("inc_acquire", (name, namespace, result), {}))
 
+    def inc_queue_total(self, name: str, namespace: str) -> None:
+        self.events.append(("inc_queue_total", (name, namespace), {}))
+
     def inc_lock_lost(self, name: str, namespace: str) -> None:
         self.events.append(("inc_lock_lost", (name, namespace), {}))
 
@@ -119,6 +122,7 @@ def test_metrics_waiting_gauge(redis_client, metrics: DummyMetrics):
 
     assert _has_event(metrics.events, "set_waiting", "metrics-waiting", 1)
     assert _has_event(metrics.events, "set_waiting", "metrics-waiting", 0)
+    assert _has_event(metrics.events, "inc_queue_total", "metrics-waiting")
 
 
 def test_metrics_lock_lost(redis_client, metrics: DummyMetrics):
@@ -269,6 +273,7 @@ def test_prometheus_metrics_basic():
     metrics.set_waiting("name", "ns", 3)
     metrics.observe_wait_seconds("name", "ns", 0.1, "success")
     metrics.inc_acquire("name", "ns", "success")
+    metrics.inc_queue_total("name", "ns")
     metrics.inc_lock_lost("name", "ns")
 
 
@@ -279,4 +284,5 @@ def test_noop_metrics_methods():
     metrics.set_waiting("name", "ns", 0)
     metrics.observe_wait_seconds("name", "ns", 0.1, "success")
     metrics.inc_acquire("name", "ns", "success")
+    metrics.inc_queue_total("name", "ns")
     metrics.inc_lock_lost("name", "ns")

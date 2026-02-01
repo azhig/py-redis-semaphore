@@ -1,0 +1,6 @@
+client-1:gpt-4o:
+  upstream_base_url: https://api.openai.com/v1
+  semaphore_capacity: 3
+
+client-1:text-embedding-3-small:
+  semaphore_capacity: 2

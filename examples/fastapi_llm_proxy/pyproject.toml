@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastapi-llm-proxy-example"
+version = "0.1.0"
+description = "FastAPI LLM proxy example for redis-semaphore"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.100",
+  "httpx>=0.24",
+  "py-redis-semaphore>=0.1.0",
+  "structlog>=24.0",
+  "prometheus-client>=0.16",
+  "prometheus-fastapi-instrumentator>=6.0",
+  "pydantic-settings>=2.0",
+  "pyyaml>=6.0",
+  "python-dotenv>=1.0",
+  "uvicorn>=0.23",
+]
+
+[tool.setuptools]
+packages = ["llm_proxy"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["llm_proxy"]
+
+[tool.ruff.format]

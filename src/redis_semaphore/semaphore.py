@@ -230,6 +230,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                     self._config.namespace,
                     self._waiting,
                 )
+                self._metrics.inc_queue_total(
+                    self._config.name,
+                    self._config.namespace,
+                )
 
     def _decrement_waiting(self) -> None:
         with self._wait_lock:
