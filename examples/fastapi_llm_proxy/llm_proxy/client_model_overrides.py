@@ -69,7 +69,7 @@ def _load_mapping(path: str) -> Any:
             import yaml  # type: ignore[import-untyped]
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise ImportError(
-                "PyYAML is required to load YAML overrides. " "Install it or use JSON."
+                "PyYAML is required to load YAML overrides. Install it or use JSON."
             ) from exc
         return yaml.safe_load(raw)
 

@@ -560,9 +560,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 self._log_and_record_status(current_count)
 
             if success:
-                return self._handle_acquire_success(
-                    fencing_token, expires_at, current_count, state
-                )
+                return self._handle_acquire_success(fencing_token, expires_at, current_count, state)
 
             if not blocking:
                 return self._handle_non_blocking_failure(current_count)
@@ -751,9 +749,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             )
             return self._build_status(count, is_owner, expires_ms)
 
-    def _build_status(
-        self, count: int, is_owner: bool, expires_ms: int | None
-    ) -> SemaphoreStatus:
+    def _build_status(self, count: int, is_owner: bool, expires_ms: int | None) -> SemaphoreStatus:
         return SemaphoreStatus(
             name=self._config.name,
             limit=self._config.limit,
@@ -782,9 +778,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         """Async version of :meth:`cleanup`."""
         with backend_errors("cleanup", self._config.name):
             now_ms = await self._get_time_ms_async()
-            return await self._runner.cleanup_async(
-                self._script_client, self.owners_key, now_ms
-            )
+            return await self._runner.cleanup_async(self._script_client, self.owners_key, now_ms)
 
     def _reset_state(self) -> None:
         """Reset internal state after release."""

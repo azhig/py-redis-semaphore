@@ -46,9 +46,7 @@ def build_upstream_url(base_url: str, request: Request) -> str:
         combined_path = f"{base_path}{request_path}"
 
     combined_path = combined_path or "/"
-    return urlunsplit(
-        (split_base.scheme, split_base.netloc, combined_path, request.url.query, "")
-    )
+    return urlunsplit((split_base.scheme, split_base.netloc, combined_path, request.url.query, ""))
 
 
 def _strip_headers(headers: Iterable[tuple[str, str]], drop: frozenset[str]) -> dict[str, str]:
