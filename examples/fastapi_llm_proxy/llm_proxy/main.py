@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
@@ -27,6 +28,25 @@ except ImportError as err:
     ) from err
 
 
+def _tcp_keepalive_options() -> dict[int, int]:
+    """Aggressive TCP keepalive so the OS reaps a dead socket in seconds.
+
+    Without tuning, ``socket_keepalive=True`` uses kernel defaults (idle ~2h on
+    Linux), so a half-open connection lingers far too long. Built portably:
+    each option is included only if the platform exposes it (Linux uses
+    TCP_KEEPIDLE; macOS uses TCP_KEEPALIVE for the idle timer).
+    """
+    options: dict[int, int] = {}
+    idle = getattr(socket, "TCP_KEEPIDLE", None) or getattr(socket, "TCP_KEEPALIVE", None)
+    if idle is not None:
+        options[idle] = 30  # start probing after 30s idle
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        options[socket.TCP_KEEPINTVL] = 10  # probe every 10s
+    if hasattr(socket, "TCP_KEEPCNT"):
+        options[socket.TCP_KEEPCNT] = 3  # drop after 3 failed probes
+    return options
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
@@ -36,15 +56,25 @@ async def lifespan(app: FastAPI):
     setup_semaphore_metrics()
 
     overrides = load_client_model_overrides(settings.client_model_config_path)
-    redis_client = aioredis.Redis(
+    # Bounded blocking pool: excess callers wait for a free connection (up to
+    # socket_timeout) instead of the pool growing without limit under BLPOP load.
+    redis_pool = aioredis.BlockingConnectionPool(
         host=settings.redis_host,
         port=settings.redis_port,
         db=settings.redis_db,
+        max_connections=settings.redis_max_connections,
+        timeout=settings.redis_socket_timeout,
         health_check_interval=10,
         socket_keepalive=True,
-        socket_connect_timeout=5,
+        socket_keepalive_options=_tcp_keepalive_options(),
+        # Read deadline: without it a half-open connection blocks forever
+        # (until OS keepalive reaps it, ~2h with kernel defaults), freezing
+        # every Redis-touching endpoint. Must stay < semaphore_lock_timeout.
+        socket_timeout=settings.redis_socket_timeout,
+        socket_connect_timeout=settings.redis_socket_connect_timeout,
         retry_on_timeout=True,
     )
+    redis_client = aioredis.Redis(connection_pool=redis_pool)
     http_client = httpx.AsyncClient(timeout=settings.upstream_timeout)
     pool = SemaphorePool(
         redis_client,
@@ -91,7 +121,8 @@ async def acquire_timeout_handler(request: Request, exc: AcquireTimeoutError) ->
         client_id=getattr(request.state, "client_id", None),
         model=getattr(request.state, "model", None),
     ).warning("Queue wait timeout")
-    return rate_limit_response()
+    timeout = getattr(request.app.state.settings, "semaphore_acquire_timeout", None)
+    return rate_limit_response(timeout)
 
 
 # Register routers

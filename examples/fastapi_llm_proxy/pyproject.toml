@@ -35,3 +35,10 @@ select = ["E", "F", "I"]
 known-first-party = ["llm_proxy"]
 
 [tool.ruff.format]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["llm_proxy"]
+# Third-party packages here ship without type stubs in this example's env.
+ignore_missing_imports = true
+warn_unused_ignores = true

@@ -28,7 +28,10 @@ import redis.asyncio as aioredis
 # ARGV[3] = lock_timeout_ms (TTL in milliseconds)
 # ARGV[4] = current_time_ms (current timestamp in milliseconds)
 #
-# Returns: [success (0/1), fencing_token or nil, expires_at_ms or nil]
+# Returns: [success (0/1), fencing_token or nil, expires_at_ms or nil, used_slots]
+#   used_slots is the occupancy observed atomically by this call (including the
+#   caller on success). It lets the client feed metrics/logs without a separate
+#   status round-trip.
 ACQUIRE_SCRIPT = """
 local owners_key = KEYS[1]
 local fencing_key = KEYS[2]
@@ -40,7 +43,10 @@ local now_ms = tonumber(ARGV[4])
 -- 1. Cleanup: remove expired entries (score < now)
 redis.call('ZREMRANGEBYSCORE', owners_key, '-inf', now_ms)
 
--- 2. Check if we already own the lock (re-entrant acquire)
+-- 2. Current occupancy, computed once and returned to the caller for metrics.
+local current_count = redis.call('ZCARD', owners_key)
+
+-- 3. Check if we already own the lock (re-entrant acquire)
 local existing_score = redis.call('ZSCORE', owners_key, identifier)
 if existing_score then
     -- Already own it - update TTL and issue NEW fencing token
@@ -48,11 +54,8 @@ if existing_score then
     local new_expires = now_ms + lock_timeout_ms
     redis.call('ZADD', owners_key, new_expires, identifier)
     local fencing_token = redis.call('INCR', fencing_key)
-    return {1, fencing_token, new_expires}
+    return {1, fencing_token, new_expires, current_count}
 end
-
--- 3. Check current owner count
-local current_count = redis.call('ZCARD', owners_key)
 
 if current_count < limit then
     -- 4. Slot available - acquire it
@@ -62,10 +65,10 @@ if current_count < limit then
     -- 5. Increment and get fencing token
     local fencing_token = redis.call('INCR', fencing_key)
 
-    return {1, fencing_token, expires_at}
+    return {1, fencing_token, expires_at, current_count + 1}
 else
     -- 6. No slots available
-    return {0, '', ''}
+    return {0, '', '', current_count}
 end
 """
 
@@ -171,7 +174,12 @@ return {current_count, is_owner, expires_at}
 
 
 class LuaScriptRegistry:
-    """Registry for loaded Lua scripts."""
+    """Registry of Lua scripts and their locally computed SHAs.
+
+    SHAs are derived from the script bodies with SHA1 - identical to what
+    ``SCRIPT LOAD`` would return - so no network round-trip is needed to obtain
+    them. Scripts are loaded into Redis lazily by the adapter (EVAL on NOSCRIPT).
+    """
 
     SCRIPTS: ClassVar[dict[str, str]] = {
         "acquire": ACQUIRE_SCRIPT,
@@ -181,47 +189,23 @@ class LuaScriptRegistry:
         "status": STATUS_SCRIPT,
     }
 
-    def __init__(self) -> None:
-        self._sha_cache: dict[str, str] = {}
-
-    def load_all(self, client: ScriptClient) -> None:
-        """Load all scripts into Redis and cache their SHAs."""
-        for name, script in self.SCRIPTS.items():
-            result = client.script_load(script)
-            if not isinstance(result, str):
-                raise TypeError("script_load returned non-str")
-            sha: str = result
-            self._sha_cache[name] = sha
-
-    async def load_all_async(self, client: ScriptClient) -> None:
-        """Async version of load_all."""
-        for name, script in self.SCRIPTS.items():
-            result = await client.ascript_load(script)
-            if not isinstance(result, str):
-                raise TypeError("script_load returned non-str")
-            sha: str = result
-            self._sha_cache[name] = sha
+    SHAS: ClassVar[dict[str, str]] = {
+        name: hashlib.sha1(script.encode()).hexdigest() for name, script in SCRIPTS.items()
+    }
 
     def get_sha(self, name: str) -> str:
-        """Get the SHA of a loaded script."""
-        if name not in self._sha_cache:
-            raise ValueError(f"Script '{name}' not loaded")
-        return self._sha_cache[name]
+        """Get the locally computed SHA of a script by name."""
+        try:
+            return self.SHAS[name]
+        except KeyError:
+            raise ValueError(f"Unknown script '{name}'") from None
 
     def get_script(self, name: str) -> str:
         """Get the Lua script source by name."""
-        if name not in self.SCRIPTS:
-            raise ValueError(f"Unknown script '{name}'")
-        return self.SCRIPTS[name]
-
-    def invalidate(self) -> None:
-        """Clear the SHA cache (call after NOSCRIPT error)."""
-        self._sha_cache.clear()
-
-    @property
-    def is_loaded(self) -> bool:
-        """Check if scripts have been loaded."""
-        return len(self._sha_cache) == len(self.SCRIPTS)
+        try:
+            return self.SCRIPTS[name]
+        except KeyError:
+            raise ValueError(f"Unknown script '{name}'") from None
 
 
 class LuaScriptRunner:
@@ -239,7 +223,7 @@ class LuaScriptRunner:
         limit: int,
         lock_timeout_ms: int,
         now_ms: int,
-    ) -> tuple[bool, int | None, int | None]:
+    ) -> tuple[bool, int | None, int | None, int]:
         result: object = client.evalsha(
             self._registry.get_sha("acquire"),
             2,
@@ -288,7 +272,7 @@ class LuaScriptRunner:
         limit: int,
         lock_timeout_ms: int,
         now_ms: int,
-    ) -> tuple[bool, int | None, int | None]:
+    ) -> tuple[bool, int | None, int | None, int]:
         result: object = await client.aevalsha(
             self._registry.get_sha("acquire"),
             2,
@@ -328,6 +312,24 @@ class LuaScriptRunner:
         )
         return bool(result)
 
+    def cleanup(self, client: ScriptClient, owners_key: str, now_ms: int) -> int:
+        result: object = client.evalsha(
+            self._registry.get_sha("cleanup"),
+            1,
+            owners_key,
+            now_ms,
+        )
+        return _to_int(result)
+
+    async def cleanup_async(self, client: ScriptClient, owners_key: str, now_ms: int) -> int:
+        result: object = await client.aevalsha(
+            self._registry.get_sha("cleanup"),
+            1,
+            owners_key,
+            now_ms,
+        )
+        return _to_int(result)
+
     def status(
         self,
         client: ScriptClient,
@@ -361,16 +363,17 @@ class LuaScriptRunner:
         return _parse_status_result(result)
 
 
-def _parse_acquire_result(result: object) -> tuple[bool, int | None, int | None]:
-    if not isinstance(result, list | tuple) or len(result) != 3:
+def _parse_acquire_result(result: object) -> tuple[bool, int | None, int | None, int]:
+    if not isinstance(result, list | tuple) or len(result) != 4:
         raise ValueError("Unexpected acquire result shape")
 
-    success_raw, fencing_raw, expires_raw = result
+    success_raw, fencing_raw, expires_raw, count_raw = result
     success = _to_bool(success_raw)
 
     fencing = _to_optional_int(fencing_raw)
     expires = _to_optional_int(expires_raw)
-    return success, fencing, expires
+    count = _to_int(count_raw)
+    return success, fencing, expires, count
 
 
 def _parse_status_result(result: object) -> tuple[int, bool, int | None]:
@@ -434,49 +437,23 @@ ScriptArg: TypeAlias = bytes | str | int | float | memoryview | bytearray
 
 
 class ScriptClient(Protocol):
-    def script_load(self, script: str) -> str: ...
-
-    def ascript_load(self, script: str) -> Awaitable[str]: ...
-
     def evalsha(self, sha: str, numkeys: int, *args: ScriptArg) -> object: ...
 
     def aevalsha(self, sha: str, numkeys: int, *args: ScriptArg) -> Awaitable[object]: ...
 
 
 class ScriptClientAdapter:
-    """Adapter for Redis client with NOSCRIPT retry support."""
+    """Runs cached Lua scripts via EVALSHA with a transparent EVAL fallback.
 
-    def __init__(
-        self,
-        client: redis.Redis | aioredis.Redis,
-        registry: LuaScriptRegistry | None = None,
-    ) -> None:
+    The script SHA is computed locally, so the first call needs no SCRIPT LOAD.
+    If Redis does not know the script yet (NOSCRIPT - e.g. after a restart or
+    failover), the adapter falls back to EVAL with the full body, which executes
+    the script and caches it server-side for subsequent EVALSHA calls.
+    """
+
+    def __init__(self, client: redis.Redis | aioredis.Redis) -> None:
         self._client = client
         self._is_async = isinstance(client, aioredis.Redis)
-        self._registry = registry
-
-    def set_registry(self, registry: LuaScriptRegistry) -> None:
-        """Set the script registry for NOSCRIPT retry."""
-        self._registry = registry
-
-    def script_load(self, script: str) -> str:
-        if self._is_async:
-            raise RuntimeError("sync script_load not supported")
-        result = self._client.script_load(script)
-        if not isinstance(result, str):
-            raise TypeError("script_load returned non-str")
-        return result
-
-    async def ascript_load(self, script: str) -> str:
-        if not self._is_async:
-            raise RuntimeError("async script_load not supported")
-        result = self._client.script_load(script)
-        if isinstance(result, str):
-            return result
-        resolved = await result
-        if not isinstance(resolved, str):
-            raise TypeError("script_load returned non-str")
-        return resolved
 
     def evalsha(self, sha: str, numkeys: int, *args: ScriptArg) -> object:
         if self._is_async:
@@ -484,52 +461,22 @@ class ScriptClientAdapter:
         try:
             return self._client.evalsha(sha, numkeys, *args)
         except redis.exceptions.NoScriptError:
-            return self._handle_noscript_sync(sha, numkeys, *args)
-
-    def _handle_noscript_sync(self, sha: str, numkeys: int, *args: ScriptArg) -> object:
-        """Handle NOSCRIPT error by reloading scripts and retrying."""
-        if self._registry is None:
-            raise RuntimeError("No registry set for NOSCRIPT retry")
-
-        # Find script name by SHA and reload all scripts
-        self._registry.invalidate()
-        self._registry.load_all(self)
-
-        # Retry with new SHA
-        new_sha = self._registry.get_sha(self._find_script_name_by_sha(sha))
-        return self._client.evalsha(new_sha, numkeys, *args)
-
-    def _find_script_name_by_sha(self, sha: str) -> str:
-        """Find script name that had this SHA (before invalidation)."""
-        for name, script in LuaScriptRegistry.SCRIPTS.items():
-            computed_sha = hashlib.sha1(script.encode()).hexdigest()
-            if computed_sha == sha:
-                return name
-        raise ValueError(f"Unknown script SHA: {sha}")
+            return self._client.eval(self._script_for_sha(sha), numkeys, *args)
 
     async def aevalsha(self, sha: str, numkeys: int, *args: ScriptArg) -> object:
         if not self._is_async:
             raise RuntimeError("async evalsha not supported")
         try:
             result = self._client.evalsha(sha, numkeys, *args)
-            if not isinstance(result, Awaitable):
-                return result
-            return await result
+            return await result if isinstance(result, Awaitable) else result
         except redis.exceptions.NoScriptError:
-            return await self._handle_noscript_async(sha, numkeys, *args)
+            result = self._client.eval(self._script_for_sha(sha), numkeys, *args)
+            return await result if isinstance(result, Awaitable) else result
 
-    async def _handle_noscript_async(self, sha: str, numkeys: int, *args: ScriptArg) -> object:
-        """Handle NOSCRIPT error by reloading scripts and retrying (async)."""
-        if self._registry is None:
-            raise RuntimeError("No registry set for NOSCRIPT retry")
-
-        # Find script name by SHA and reload all scripts
-        self._registry.invalidate()
-        await self._registry.load_all_async(self)
-
-        # Retry with new SHA
-        new_sha = self._registry.get_sha(self._find_script_name_by_sha(sha))
-        result = self._client.evalsha(new_sha, numkeys, *args)
-        if not isinstance(result, Awaitable):
-            return result
-        return await result
+    @staticmethod
+    def _script_for_sha(sha: str) -> str:
+        """Reverse-map a SHA to its script body (for the EVAL fallback)."""
+        for script in LuaScriptRegistry.SCRIPTS.values():
+            if hashlib.sha1(script.encode()).hexdigest() == sha:
+                return script
+        raise ValueError(f"Unknown script SHA: {sha}")

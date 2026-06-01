@@ -1,4 +1,6 @@
-"""Tests for LuaScriptRegistry."""
+"""Tests for LuaScriptRegistry / LuaScriptRunner."""
+
+import hashlib
 
 import pytest
 
@@ -6,37 +8,17 @@ import redis_semaphore.lua_scripts as lua_scripts
 from redis_semaphore.lua_scripts import LuaScriptRegistry, LuaScriptRunner, ScriptClientAdapter
 
 
-def test_registry_requires_load():
-    """get_sha should fail before scripts are loaded."""
+def test_registry_sha_is_local_and_correct():
+    """SHAs are computed locally and match SHA1 of the script body."""
     registry = LuaScriptRegistry()
-    assert registry.is_loaded is False
-
-    with pytest.raises(ValueError):
-        registry.get_sha("acquire")
-
-
-def test_registry_load_all(redis_client):
-    """load_all loads all scripts and makes SHAs available."""
-    registry = LuaScriptRegistry()
-    client = ScriptClientAdapter(redis_client)
-    registry.load_all(client)
-
-    assert registry.is_loaded is True
     sha = registry.get_sha("acquire")
-    assert isinstance(sha, str) and sha
-    runner = LuaScriptRunner(registry)
-    success, token, expires = runner.acquire(
-        client,
-        "test:owners",
-        "test:fencing",
-        "id",
-        1,
-        1000,
-        0,
-    )
-    assert success is True
-    assert token is not None
-    assert expires is not None
+    assert sha == hashlib.sha1(LuaScriptRegistry.SCRIPTS["acquire"].encode()).hexdigest()
+
+
+def test_registry_get_sha_unknown():
+    registry = LuaScriptRegistry()
+    with pytest.raises(ValueError):
+        registry.get_sha("missing")
 
 
 def test_registry_get_script_unknown():
@@ -47,38 +29,58 @@ def test_registry_get_script_unknown():
 
 def test_registry_get_script():
     registry = LuaScriptRegistry()
-    script = registry.get_script("acquire")
-    assert isinstance(script, str) and script
+    assert isinstance(registry.get_script("acquire"), str)
 
 
-def test_registry_invalidate(redis_client):
+def test_runner_acquire_lazy_loads_via_eval(redis_client):
+    """First EVALSHA misses (NOSCRIPT) and transparently falls back to EVAL."""
+    redis_client.script_flush()  # ensure the script is NOT cached server-side
     registry = LuaScriptRegistry()
     client = ScriptClientAdapter(redis_client)
-    registry.load_all(client)
-    assert registry.is_loaded is True
+    runner = LuaScriptRunner(registry)
 
-    registry.invalidate()
+    success, token, expires, count = runner.acquire(
+        client, "test:owners", "test:fencing", "id", 1, 1000, 0
+    )
+    assert success is True
+    assert token is not None
+    assert expires is not None
+    assert count == 1  # one slot now occupied (us)
 
-    assert registry.is_loaded is False
 
-
-def test_registry_load_all_type_error():
-    class BadClient:
-        def script_load(self, script: str):
-            return 123
-
-        def evalsha(self, sha: str, numkeys: int, *args):
-            return 1
-
-        async def ascript_load(self, script: str):
-            return 123
-
-        async def aevalsha(self, sha: str, numkeys: int, *args):
-            return 1
-
+@pytest.mark.asyncio
+async def test_runner_acquire_async_lazy_loads_via_eval(async_redis_client):
+    await async_redis_client.script_flush()
     registry = LuaScriptRegistry()
-    with pytest.raises(TypeError):
-        registry.load_all(BadClient())
+    client = ScriptClientAdapter(async_redis_client)
+    runner = LuaScriptRunner(registry)
+
+    success, token, expires, count = await runner.acquire_async(
+        client, "test:owners", "test:fencing", "id", 1, 1000, 0
+    )
+    assert success is True
+    assert token is not None
+    assert expires is not None
+    assert count == 1
+
+
+def test_cleanup_parsing():
+    class CleanupClient:
+        def evalsha(self, sha: str, numkeys: int, *args):
+            return 3
+
+    runner = LuaScriptRunner(LuaScriptRegistry())
+    assert runner.cleanup(CleanupClient(), "key", 0) == 3
+
+
+@pytest.mark.asyncio
+async def test_cleanup_async_parsing():
+    class CleanupClient:
+        async def aevalsha(self, sha: str, numkeys: int, *args):
+            return b"2"
+
+    runner = LuaScriptRunner(LuaScriptRegistry())
+    assert await runner.cleanup_async(CleanupClient(), "key", 0) == 2
 
 
 def test_status_parsing_bytes():
@@ -86,10 +88,7 @@ def test_status_parsing_bytes():
         def evalsha(self, sha: str, numkeys: int, *args):
             return [b"2", b"1", b"123"]
 
-    registry = LuaScriptRegistry()
-    registry._sha_cache = {"status": "sha"}
-    runner = LuaScriptRunner(registry)
-
+    runner = LuaScriptRunner(LuaScriptRegistry())
     count, is_owner, expires = runner.status(StatusClient(), "key", 0, "id")
     assert count == 2
     assert is_owner is True
@@ -102,59 +101,11 @@ async def test_status_parsing_async():
         async def aevalsha(self, sha: str, numkeys: int, *args):
             return [b"1", b"0", b""]
 
-    registry = LuaScriptRegistry()
-    registry._sha_cache = {"status": "sha"}
-    runner = LuaScriptRunner(registry)
-
+    runner = LuaScriptRunner(LuaScriptRegistry())
     count, is_owner, expires = await runner.status_async(StatusClient(), "key", 0, None)
     assert count == 1
     assert is_owner is False
     assert expires is None
-
-
-@pytest.mark.asyncio
-async def test_registry_load_all_async(async_redis_client):
-    """load_all_async loads scripts for async client."""
-    registry = LuaScriptRegistry()
-    client = ScriptClientAdapter(async_redis_client)
-    await registry.load_all_async(client)
-
-    assert registry.is_loaded is True
-    sha = registry.get_sha("release")
-    assert isinstance(sha, str) and sha
-    runner = LuaScriptRunner(registry)
-    success, token, expires = await runner.acquire_async(
-        client,
-        "test:owners",
-        "test:fencing",
-        "id",
-        1,
-        1000,
-        0,
-    )
-    assert success is True
-    assert token is not None
-    assert expires is not None
-
-
-@pytest.mark.asyncio
-async def test_registry_load_all_async_type_error():
-    class BadClient:
-        def script_load(self, script: str):
-            return 123
-
-        async def ascript_load(self, script: str):
-            return 123
-
-        def evalsha(self, sha: str, numkeys: int, *args):
-            return 1
-
-        async def aevalsha(self, sha: str, numkeys: int, *args):
-            return 1
-
-    registry = LuaScriptRegistry()
-    with pytest.raises(TypeError):
-        await registry.load_all_async(BadClient())
 
 
 def test_status_invalid_shape():
@@ -162,10 +113,7 @@ def test_status_invalid_shape():
         def evalsha(self, sha: str, numkeys: int, *args):
             return [1, 2]
 
-    registry = LuaScriptRegistry()
-    registry._sha_cache = {"status": "sha"}
-    runner = LuaScriptRunner(registry)
-
+    runner = LuaScriptRunner(LuaScriptRegistry())
     with pytest.raises(ValueError):
         runner.status(BadStatusClient(), "key", 0, None)
 
@@ -175,10 +123,7 @@ def test_status_invalid_type():
         def evalsha(self, sha: str, numkeys: int, *args):
             return ["nope", "1", ""]
 
-    registry = LuaScriptRegistry()
-    registry._sha_cache = {"status": "sha"}
-    runner = LuaScriptRunner(registry)
-
+    runner = LuaScriptRunner(LuaScriptRegistry())
     with pytest.raises(ValueError):
         runner.status(BadStatusClient(), "key", 0, None)
 
@@ -188,10 +133,7 @@ def test_acquire_invalid_shape():
         def evalsha(self, sha: str, numkeys: int, *args):
             return [1, 2]
 
-    registry = LuaScriptRegistry()
-    registry._sha_cache = {"acquire": "sha"}
-    runner = LuaScriptRunner(registry)
-
+    runner = LuaScriptRunner(LuaScriptRegistry())
     with pytest.raises(ValueError):
         runner.acquire(BadAcquireClient(), "owners", "fencing", "id", 1, 1, 0)
 

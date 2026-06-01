@@ -524,3 +524,54 @@ class TestConfigValidation:
                 limit=1,
                 blpop_timeout=0,
             )
+
+
+def test_acquire_result_reports_used_slots(redis_client):
+    """used_slots reflects atomic occupancy without a separate status round-trip."""
+    config = SemaphoreConfig(name="test-used-slots", limit=2, namespace="t")
+
+    sem1 = Semaphore(redis_client, config)
+    r1 = sem1.acquire(blocking=False)
+    assert r1.success is True
+    assert r1.used_slots == 1  # just us
+
+    sem2 = Semaphore(redis_client, config)
+    r2 = sem2.acquire(blocking=False)
+    assert r2.success is True
+    assert r2.used_slots == 2  # both slots taken
+
+    sem3 = Semaphore(redis_client, config)
+    r3 = sem3.acquire(blocking=False)
+    assert r3.success is False
+    assert r3.used_slots == 2  # full
+
+    sem1.release()
+    sem2.release()
+
+
+def test_blpop_does_not_overshoot_acquire_timeout(redis_client):
+    """BLPOP wait is capped by the remaining acquire_timeout (no overshoot)."""
+    from redis_semaphore import AcquireMode
+
+    config = SemaphoreConfig(
+        name="test-blpop-no-overshoot",
+        limit=1,
+        acquire_mode=AcquireMode.BLPOP,
+        blpop_timeout=5.0,  # much larger than acquire_timeout
+        acquire_timeout=0.3,
+        namespace="t",
+    )
+
+    sem1 = Semaphore(redis_client, config)
+    sem1.acquire(blocking=False)
+
+    sem2 = Semaphore(redis_client, config)
+    start = time.monotonic()
+    with pytest.raises(AcquireTimeoutError):
+        sem2.acquire(blocking=True)
+    elapsed = time.monotonic() - start
+
+    # Without the cap this would block ~5s (one full blpop_timeout); with it ~0.3s.
+    assert elapsed < 1.0
+
+    sem1.release()

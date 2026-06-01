@@ -35,6 +35,7 @@ class SemaphorePool:
         self._capacity_overrides = capacity_overrides or {}
         self._lock_timeout = settings.semaphore_lock_timeout
         self._acquire_timeout = settings.semaphore_acquire_timeout
+        self._blpop_timeout = settings.semaphore_blpop_timeout
         self._namespace = settings.semaphore_namespace
         self._configs: dict[str, SemaphoreConfig] = {}
         self._lock = asyncio.Lock()
@@ -53,6 +54,7 @@ class SemaphorePool:
                         limit=limit,
                         lock_timeout=self._lock_timeout,
                         acquire_timeout=self._acquire_timeout,
+                        blpop_timeout=self._blpop_timeout,
                         namespace=self._namespace,
                         acquire_mode=AcquireMode.BLPOP,
                     )
@@ -69,6 +71,7 @@ class SemaphorePool:
                         limit=limit,
                         lock_timeout=self._lock_timeout,
                         acquire_timeout=self._acquire_timeout,
+                        blpop_timeout=self._blpop_timeout,
                         namespace=self._namespace,
                         acquire_mode=AcquireMode.BLPOP,
                     )

@@ -25,12 +25,43 @@ class AcquireMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class AcquireResult:
-    """Result of an acquire operation."""
+    """Result of an acquire operation.
+
+    Attributes:
+        used_slots: Slots occupied as observed atomically by the acquire call
+            (includes the caller on success). Useful for observability.
+    """
 
     success: bool
     identifier: str | None
     fencing_token: int | None
     expires_at: float | None
+    used_slots: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SemaphoreStatus:
+    """Point-in-time view of a semaphore, observed without acquiring.
+
+    Reading the status atomically removes expired owner entries first, so
+    ``used_slots`` reflects live holders only.
+
+    Attributes:
+        name: Semaphore name.
+        limit: Maximum number of concurrent holders.
+        used_slots: Live (non-expired) holders at observation time.
+        available: ``max(0, limit - used_slots)`` free slots.
+        is_owner: Whether the calling instance currently holds a slot.
+        expires_at: Epoch seconds when the caller's slot expires, or None if
+            the caller is not an owner.
+    """
+
+    name: str
+    limit: int
+    used_slots: int
+    available: int
+    is_owner: bool
+    expires_at: float | None = None
 
 
 @dataclass(slots=True)
@@ -54,6 +85,12 @@ class SemaphoreConfig:
         retry_backoff_multiplier: Multiplier for exponential backoff (default: 2.0).
         retry_jitter: Random jitter as fraction of interval, 0.0-1.0 (default: 0.0).
         blpop_timeout: Timeout for BLPOP before fallback retry (default: 5.0).
+        refresh_retry_interval: Step between heartbeat refresh retries after a
+            connection error, in seconds (None = min(refresh_interval, 1.0)).
+            When the heartbeat cannot refresh the lock (e.g. Redis is
+            unreachable) it retries at this shorter interval until either the
+            connection recovers or lock_timeout elapses since the last
+            successful refresh, at which point the lock is treated as lost.
     """
 
     name: str
@@ -70,6 +107,7 @@ class SemaphoreConfig:
     retry_backoff_multiplier: float = 2.0
     retry_jitter: float = 0.0
     blpop_timeout: float = 5.0
+    refresh_retry_interval: float | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -92,3 +130,5 @@ class SemaphoreConfig:
             raise ValueError("retry_jitter must be between 0.0 and 1.0")
         if self.blpop_timeout <= 0:
             raise ValueError("blpop_timeout must be > 0")
+        if self.refresh_retry_interval is not None and self.refresh_retry_interval <= 0:
+            raise ValueError("refresh_retry_interval must be > 0 or None")

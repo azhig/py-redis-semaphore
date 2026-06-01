@@ -64,7 +64,20 @@ Key settings:
 - `UPSTREAM_BASE_URL` — base URL of your LLM provider (should include `/v1`)
 - `SEMAPHORE_CAPACITY` — concurrent slots per client_id+model
 - `SEMAPHORE_ACQUIRE_TIMEOUT` — maximum queue wait time in seconds
+- `SEMAPHORE_BLPOP_TIMEOUT` — per-iteration BLPOP wait in seconds
+- `SEMAPHORE_LOCK_TIMEOUT` — server-side slot TTL (heartbeat refreshes it)
+- `REDIS_SOCKET_TIMEOUT` — read deadline for Redis commands
+- `REDIS_SOCKET_CONNECT_TIMEOUT` — connection-establishment deadline
 - `REDIS_CHECK_INTERVAL` — seconds between Redis recovery polls while down
+
+> **Timeout invariant:** keep
+> `SEMAPHORE_BLPOP_TIMEOUT < REDIS_SOCKET_TIMEOUT < SEMAPHORE_LOCK_TIMEOUT`.
+> Without a `REDIS_SOCKET_TIMEOUT`, a half-open/stalled connection blocks
+> every Redis-touching endpoint (including `/semaphore/status`) until the OS
+> TCP keepalive reaps the socket — minutes-to-hours with kernel defaults,
+> which looks like the whole app hanging. But the read deadline must stay
+> **above** `SEMAPHORE_BLPOP_TIMEOUT`, otherwise a normal blocking wait trips
+> the socket timeout and raises a spurious error instead of returning.
 
 ## Running
 ```bash
@@ -89,8 +102,8 @@ Any other paths (e.g., `/v1/models`, `/v1/files`) are proxied without rate limit
 
 ### Per-client/model overrides
 
-You can override `upstream_base_url` and `semaphore_capacity` for конкретной пары `client_id:model`
-через JSON/YAML файл. Задайте путь в `CLIENT_MODEL_CONFIG_PATH`.
+You can override `upstream_base_url` and `semaphore_capacity` for a specific `client_id:model`
+pair via a JSON/YAML file. Set its path in `CLIENT_MODEL_CONFIG_PATH`.
 
 Example `client_model_overrides.example.json`:
 ```json
@@ -105,7 +118,7 @@ Example `client_model_overrides.example.json`:
 }
 ```
 
-Если пары нет в файле, используются значения по умолчанию из `.env`.
+If a pair is not present in the file, the defaults from `.env` are used.
 
 ### Redis Downtime Handling
 
@@ -113,7 +126,9 @@ When Redis becomes unavailable, the proxy does not switch to local semaphores. I
 
 **During Redis downtime:**
 - Active requests holding Redis slots continue executing without interruption
-- New requests wait in the queue until Redis responds again
+- New requests wait for recovery, but only up to `SEMAPHORE_ACQUIRE_TIMEOUT`;
+  past that budget the request returns `503 redis_unavailable` instead of
+  hanging indefinitely
 
 **Redis recovery (checked every `REDIS_CHECK_INTERVAL` seconds):**
 1. A single waiter polls Redis
@@ -147,7 +162,10 @@ export UPSTREAM_BASE_URL=http://localhost:11434/v1
 
 ## Monitoring
 - Metrics: `GET /metrics`
-- Health: `GET /health`
+- Liveness: `GET /health` — process is up; never touches Redis (use for the
+  liveness probe so a Redis blip doesn't restart the process)
+- Readiness: `GET /ready` — live Redis `PING`; returns `503` when Redis is down
+  (use for the readiness probe / load-balancer gate)
 - Semaphore status (debug): `GET /semaphore/status`
 
 `/metrics` includes FastAPI HTTP metrics (via `prometheus-fastapi-instrumentator`) and redis-semaphore internal metrics in the same registry.

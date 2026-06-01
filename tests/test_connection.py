@@ -41,6 +41,27 @@ def _sentinel_config() -> SentinelConfig:
     )
 
 
+def test_redis_config_repr_hides_password():
+    """Passwords must not leak into repr()/logs."""
+    rendered = repr(RedisConfig(host="h", port=6380, password="super-secret"))
+    assert "super-secret" not in rendered
+    assert "password" not in rendered
+
+
+def test_sentinel_config_repr_hides_passwords():
+    """Both Sentinel passwords must be excluded from repr()."""
+    rendered = repr(
+        SentinelConfig(
+            sentinels=[("h", 26379)],
+            service_name="mymaster",
+            password="data-secret",
+            sentinel_password="sentinel-secret",
+        )
+    )
+    assert "data-secret" not in rendered
+    assert "sentinel-secret" not in rendered
+
+
 def test_create_sync_direct():
     """Factory creates a direct sync client."""
     config = RedisConfig(host="localhost", port=_redis_port(), db=15)

@@ -1,6 +1,6 @@
 [project]
 name = "py-redis-semaphore"
-version = "0.1.0"
+version = "0.1.1"
 description = "Distributed semaphore and mutex with Redis and Sentinel support"
 readme = "README.md"
 license = "MIT"
@@ -118,7 +118,6 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "S105", "S106"]  # asserts and hardcoded passwords OK in tests
 "examples/**/*.py" = ["T201"]  # print OK in examples
-"main.py" = ["T201"]  # print OK in main
 
 [tool.mypy]
 python_version = "3.10"

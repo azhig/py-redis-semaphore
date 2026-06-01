@@ -52,3 +52,30 @@ class TestMutexBasic:
 
         with pytest.raises(NotAcquiredError):
             mutex.release()
+
+
+def test_mutex_forwards_wait_settings():
+    """Mutex propagates wait-strategy settings into its SemaphoreConfig."""
+    from unittest.mock import MagicMock
+
+    from redis_semaphore import AcquireMode
+
+    mutex = Mutex(
+        MagicMock(),
+        "m",
+        acquire_mode=AcquireMode.POLLING,
+        blpop_timeout=2.0,
+        retry_interval_max=1.5,
+        retry_backoff_multiplier=3.0,
+        retry_jitter=0.25,
+        refresh_retry_interval=0.5,
+    )
+
+    cfg = mutex.config
+    assert cfg.limit == 1
+    assert cfg.acquire_mode == AcquireMode.POLLING
+    assert cfg.blpop_timeout == 2.0
+    assert cfg.retry_interval_max == 1.5
+    assert cfg.retry_backoff_multiplier == 3.0
+    assert cfg.retry_jitter == 0.25
+    assert cfg.refresh_retry_interval == 0.5
