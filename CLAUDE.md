@@ -67,13 +67,13 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 
 - `{namespace}:{name}:owners` - Sorted Set (member=identifier, score=expires_at_ms)
 - `{namespace}:{name}:fencing` - String (monotonic counter for fencing tokens)
-- `{namespace}:{name}:queue` - List (for BLPOP notifications in BLPOP mode)
+- `{namespace}:{name}:queue` - List (for BLPOP notifications in BLPOP mode); capped at `limit` entries via LTRIM on each notify to prevent unbounded growth
 
 ### Key Concepts
 
 **Lua Scripts**: All critical operations are atomic via Lua. Scripts are loaded once and called by SHA via `EVALSHA`.
 
-**Heartbeat**: Background thread/task calls `refresh()` at `refresh_interval` (default: 80% of `lock_timeout`).
+**Heartbeat**: Background thread/task calls an internal refresh (`_heartbeat_refresh`/`_heartbeat_refresh_async`, *not* the public `refresh()`) at `refresh_interval` (default: 80% of `lock_timeout`). Transient connection errors are tolerated and retried at `refresh_retry_interval` (default: `min(refresh_interval, 1.0)`); if the lock cannot be refreshed for `lock_timeout` seconds (measured conservatively from the start of the last successful attempt), it is treated as lost. Permanent errors (e.g. ACL denial → `PermanentBackendError`) escalate immediately without waiting out the deadline. On loss the heartbeat is the single owner of lock-loss handling: it sets state `LOST`, fires `on_lock_lost`, and records the metric — this fires in `strict_mode` too (the heartbeat never raises into its own thread; `strict_mode` is enforced on the next user operation via `_check_lock_lost`). Keep the client `socket_timeout` smaller than `lock_timeout` for timely escalation.
 
 **Fencing Token**: Monotonically increasing counter returned on acquire. Protects against race conditions during GC pauses.
 
@@ -82,6 +82,8 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 **Wait Strategies**: Two modes via `acquire_mode`:
 - `POLLING` (default): Retry loop with configurable exponential backoff and jitter
 - `BLPOP`: Efficient blocking wait via Redis BLPOP with FIFO ordering
+
+**Status & cleanup**: `status()`/`astatus()` return a `SemaphoreStatus` (used_slots, available, is_owner, expires_at) observed atomically without acquiring — both purge expired owners first. `cleanup()`/`acleanup()` force-remove expired owner entries and return the count; rarely needed since `acquire()`/`status()` purge lazily. Backed by `STATUS_SCRIPT`/`CLEANUP_SCRIPT`.
 
 ## File Modification Guide
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from redis_semaphore import MixedModeError, Semaphore, SemaphoreConfig
+from redis_semaphore import AcquireMode, MixedModeError, Semaphore, SemaphoreConfig
 
 
 @pytest.mark.asyncio
@@ -45,6 +45,29 @@ def test_wait_for_lock_lost_true(redis_client):
     assert sem.refresh() is False
 
     assert sem.wait_for_lock_lost(timeout=0.1) is True
+
+
+def test_notify_queue_is_bounded(redis_client):
+    """The BLPOP notification list must not grow unboundedly under release churn.
+
+    With no waiters consuming tokens, every release LPUSHes one; without the
+    LTRIM cap the list would grow by one per release forever.
+    """
+    limit = 3
+    config = SemaphoreConfig(
+        name="notify-bounded",
+        limit=limit,
+        acquire_mode=AcquireMode.BLPOP,
+        namespace="t-notify",
+    )
+    redis_client.delete(f"t-notify:{config.name}:queue")
+
+    sem = Semaphore(redis_client, config)
+    for _ in range(50):
+        assert sem.acquire(blocking=False).success is True
+        sem.release()
+
+    assert redis_client.llen(f"t-notify:{config.name}:queue") <= limit
 
 
 @pytest.mark.asyncio

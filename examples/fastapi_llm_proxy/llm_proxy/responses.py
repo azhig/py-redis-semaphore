@@ -24,12 +24,16 @@ def bad_request(message: str, code: str) -> JSONResponse:
     )
 
 
-def rate_limit_response() -> JSONResponse:
+def rate_limit_response(timeout_seconds: float | None = None) -> JSONResponse:
+    if timeout_seconds is None:
+        message = "Queue wait timeout exceeded"
+    else:
+        message = f"Queue wait timeout exceeded ({timeout_seconds:g}s)"
     return JSONResponse(
         status_code=429,
         content={
             "error": {
-                "message": "Queue wait timeout exceeded (60 seconds)",
+                "message": message,
                 "type": "rate_limit_error",
                 "code": "queue_timeout",
             }

@@ -15,11 +15,27 @@ class Settings(BaseSettings):
     redis_host: str = Field(default="localhost")
     redis_port: int = Field(default=6379)
     redis_db: int = Field(default=0)
+    # Read/connect deadlines. Invariant: semaphore_blpop_timeout <
+    # redis_socket_timeout < semaphore_lock_timeout.
+    #  - Below lock_timeout: a stalled/half-open connection fails fast instead
+    #    of blocking until the OS TCP keepalive reaps the socket (~2h with
+    #    kernel defaults), which would freeze every Redis-touching endpoint
+    #    (incl. /semaphore/status).
+    #  - Above blpop_timeout: otherwise a normal BLPOP wait hits the socket
+    #    read deadline and raises a spurious TimeoutError instead of returning.
+    redis_socket_timeout: float = Field(default=10.0)
+    redis_socket_connect_timeout: float = Field(default=5.0)
+    # Upper bound on pooled connections. In BLPOP mode each waiting acquire
+    # holds a connection for up to blpop_timeout, so size this above expected
+    # peak concurrency. A blocking pool makes excess callers wait for a free
+    # connection (up to redis_socket_timeout) instead of growing without limit.
+    redis_max_connections: int = Field(default=64)
 
     # Semaphore
     semaphore_capacity: int = Field(default=5)
     semaphore_lock_timeout: float = Field(default=120.0)
     semaphore_acquire_timeout: float = Field(default=200.0)
+    semaphore_blpop_timeout: float = Field(default=3.0)
     semaphore_namespace: str = Field(default="llm_proxy")
 
     # Redis availability check

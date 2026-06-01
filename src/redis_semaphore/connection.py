@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import redis
 import redis.asyncio as aioredis
@@ -17,7 +17,7 @@ class RedisConfig:
     host: str = "localhost"
     port: int = 6379
     db: int = 0
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)
     socket_timeout: float = 5.0
 
 
@@ -27,8 +27,8 @@ class SentinelConfig:
 
     sentinels: list[tuple[str, int]]
     service_name: str
-    password: str | None = None
-    sentinel_password: str | None = None
+    password: str | None = field(default=None, repr=False)
+    sentinel_password: str | None = field(default=None, repr=False)
     db: int = 0
     socket_timeout: float = 5.0
     min_other_sentinels: int = 0

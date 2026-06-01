@@ -54,3 +54,53 @@ async def test_async_heartbeat_lock_lost_callback(async_redis_client):
 
     await asyncio.wait_for(event.wait(), timeout=1.0)
     assert sem.is_lost is True
+
+
+@pytest.mark.asyncio
+async def test_async_heartbeat_lock_lost_callback_strict_mode(async_redis_client):
+    """on_lock_lost must fire (cleanly) when the async heartbeat detects loss in strict_mode."""
+    event = asyncio.Event()
+
+    async def on_lock_lost(identifier: str) -> None:
+        event.set()
+
+    config = SemaphoreConfig(
+        name="test-async-heartbeat-lost-strict",
+        limit=1,
+        lock_timeout=0.5,
+        refresh_interval=0.05,
+        strict_mode=True,
+    )
+
+    sem = Semaphore(async_redis_client, config, on_lock_lost=on_lock_lost)
+    await sem.aacquire(blocking=False)
+
+    await async_redis_client.zrem(sem.owners_key, sem.identifier)
+
+    await asyncio.wait_for(event.wait(), timeout=1.0)
+    assert sem.is_lost is True
+
+    from redis_semaphore import LockLostError
+
+    with pytest.raises(LockLostError):
+        await sem.aacquire(blocking=False)
+
+
+@pytest.mark.asyncio
+async def test_cancel_async_heartbeat_stops_task(async_redis_client):
+    """_cancel_async_heartbeat best-effort stops the async heartbeat from sync code."""
+    config = SemaphoreConfig(
+        name="test-cancel-async-hb",
+        limit=1,
+        lock_timeout=10.0,
+        refresh_interval=0.5,
+        namespace="t",
+    )
+    sem = Semaphore(async_redis_client, config)
+    await sem.aacquire(blocking=False)
+    assert sem._async_heartbeat is not None
+
+    sem._cancel_async_heartbeat()  # sync best-effort (as called by atexit/__del__)
+    assert sem._async_heartbeat is None
+
+    await sem.arelease()

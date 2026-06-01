@@ -32,6 +32,7 @@ class BaseSemaphoreCommon(Generic[ClientT]):
         "_fencing_token",
         "_identifier",
         "_refresh_interval",
+        "_refresh_retry_interval",
         "_scripts",
         "_state",
     )
@@ -57,6 +58,12 @@ class BaseSemaphoreCommon(Generic[ClientT]):
             self._refresh_interval = config.lock_timeout * 0.8
         else:
             self._refresh_interval = config.refresh_interval
+
+        # Step between heartbeat refresh retries after a connection error.
+        if config.refresh_retry_interval is None:
+            self._refresh_retry_interval = min(self._refresh_interval, 1.0)
+        else:
+            self._refresh_retry_interval = config.refresh_retry_interval
 
     @property
     def owners_key(self) -> str:

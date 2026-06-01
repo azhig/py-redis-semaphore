@@ -27,39 +27,38 @@
 [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Распределённый семафор и mutex на Redis с поддержкой Sentinel, sync/async API и автоматическим heartbeat.
+Distributed semaphore and mutex on Redis with Sentinel support, a sync/async API, and an automatic heartbeat.
 
-## Возможности
+## Features
 
-- **Counting Semaphore** - ограничение до N одновременных доступов к ресурсу
-- **Mutex** - эксклюзивная блокировка (бинарный семафор)
-- **Redis Sentinel** - поддержка failover для высокой доступности
-- **Sync и Async API** - работа с threading и asyncio
-- **Heartbeat** - автоматическое продление TTL блокировки
-- **Fencing Tokens** - защита от race conditions при GC паузах
-- **Атомарные операции** - все критичные операции через Lua скрипты
-- **Гибкие стратегии ожидания** - polling с exponential backoff или BLPOP для эффективного ожидания
-- **Docker для Redis** - готовый контейнер для локальной разработки
+- **Counting Semaphore** — limit concurrent access to a resource to at most N
+- **Mutex** — exclusive lock (binary semaphore)
+- **Redis Sentinel** — failover support for high availability
+- **Sync and Async APIs** — works with both threading and asyncio
+- **Heartbeat** — automatically extends the lock TTL
+- **Fencing Tokens** — protection against race conditions during GC pauses
+- **Atomic operations** — all critical operations run via Lua scripts
+- **Flexible wait strategies** — polling with exponential backoff, or BLPOP for efficient blocking waits
+- **Docker for Redis** — ready-to-use container for local development
 
-## Установка
+## Installation
 
 ```bash
 pip install py-redis-semaphore
 ```
 
-Или с использованием uv:
+Or with uv:
 
 ```bash
 uv add py-redis-semaphore
 ```
 
-## Быстрый старт
+## Quick start
 
-### Mutex (эксклюзивная блокировка)
+### Mutex (exclusive lock)
 
-Эксклюзивная блокировка. Подходит, когда к ресурсу должен иметь доступ
-только один процесс/инстанс в любой момент времени (например, миграции
-БД, cron-задача, пересчет кэша).
+An exclusive lock. Use it when only one process/instance may access the resource
+at any point in time (e.g. database migrations, a cron job, cache recomputation).
 
 ```python
 import redis
@@ -69,33 +68,33 @@ client = redis.Redis()
 
 with Mutex(client, "my-resource") as lock:
     print(f"Fencing token: {lock.fencing_token}")
-    # Только один процесс может выполнять этот код
+    # Only one process can run this code
 ```
 
 ### Counting Semaphore
 
-Ограничивает количество одновременных владельцев ресурса до N. Используйте,
-когда ресурс допускает ограниченную параллельность (пул БД, лимит внешнего API,
-ограничение CPU/IO задач).
+Limits the number of concurrent owners of a resource to N. Use it when the
+resource tolerates bounded concurrency (a DB pool, an external API limit,
+CPU/IO task throttling).
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig
 
 config = SemaphoreConfig(
     name="database-pool",
-    limit=5,  # До 5 одновременных подключений
+    limit=5,  # Up to 5 concurrent connections
     lock_timeout=30.0,
 )
 
 with Semaphore(client, config) as sem:
-    # Работа с БД
+    # Work with the database
     pass
 ```
 
 ### Async API
 
-Асинхронные варианты для asyncio. Работают так же, как sync, но не блокируют
-event loop и используют `async with`, `aacquire`, `arelease`.
+Async variants for asyncio. They behave like their sync counterparts but do not
+block the event loop, and use `async with`, `aacquire`, and `arelease`.
 
 ```python
 import asyncio
@@ -119,10 +118,10 @@ asyncio.run(main())
 
 ### Redis Sentinel
 
-Используйте Sentinel, если Redis развернут в режиме высокой доступности
-и требуется автоматический failover при падении master.
+Use Sentinel when Redis is deployed in a high-availability setup and you need
+automatic failover when the master goes down.
 
-Пример подключения через Sentinel (Mutex и Semaphore):
+Example of connecting through Sentinel (Mutex and Semaphore):
 
 ```python
 from redis_semaphore import SentinelConfig, RedisConnectionFactory, Mutex, Semaphore, SemaphoreConfig
@@ -140,7 +139,7 @@ config = SentinelConfig(
 client = RedisConnectionFactory.create_sync(config)
 
 with Mutex(client, "ha-lock") as lock:
-    # Автоматический failover при падении master
+    # Automatic failover when the master goes down
     pass
 
 sem_cfg = SemaphoreConfig(name="ha-semaphore", limit=5)
@@ -149,59 +148,94 @@ with Semaphore(client, sem_cfg) as sem:
 ```
 
 
-## Что выбрать и когда
+## Reliability model and its limits
 
-- **Mutex** — если нужен ровно один владелец: “никто кроме меня” (миграции,
-  генерация отчетов, фоновые задачи без параллели).
-- **Semaphore** — если допустима ограниченная параллельность: “не больше N”
-  (пулы подключений, rate-limit к внешним сервисам, ограничения нагрузки).
+It is important to understand which guarantees the library provides and which it does not.
 
-## Настройка и использование
+**What is guaranteed.** All operations (acquire/release/refresh/cleanup) are atomic
+on the Redis side via Lua scripts. As long as the Redis node (master) is reachable
+and consistent, mutual exclusion holds: there can never be more than `limit` owners
+at once.
+
+**What is NOT guaranteed — failover.** This is **not Redlock** and not a
+multi-master algorithm. A lock lives on a single master (directly or via Sentinel).
+Replication in Redis is asynchronous, so when the master fails and a replica is
+promoted, the owner record may not have been replicated yet — and a second client
+can acquire the "same" slot on the new master. In other words, **during a
+failover or network split, mutual exclusion may be briefly violated.**
+
+**How to live with this — fencing tokens.** Every successful acquire returns a
+monotonically increasing `fencing_token`. Pass it to the protected resource (a DB,
+a file store, an external service) and reject operations carrying a token lower
+than the last one seen. This way safety is enforced on the resource side rather
+than by trusting the lock itself — it is the only correct way to protect against
+double ownership during failover and against GC pauses.
+
+**Clocks.** TTLs are computed using client-side time. NTP synchronization between
+clients is required; a clock skew of a few seconds breaks lock expiration.
+
+**Timeliness of loss detection.** Keep the client `socket_timeout` smaller than
+`lock_timeout`, otherwise a single stalled refresh can delay lock-loss escalation
+past the deadline.
+
+Bottom line: for task coordination, rate limiting, and pools where the resource
+verifies a fencing token, the library is production-ready. For scenarios that
+require strict mutual exclusion with zero tolerance for even a single violation
+during failover, you need a different mechanism (e.g. a consensus store).
+
+## What to choose and when
+
+- **Mutex** — when you need exactly one owner: "no one but me" (migrations,
+  report generation, background jobs that must not run in parallel).
+- **Semaphore** — when bounded concurrency is acceptable: "no more than N"
+  (connection pools, rate limiting external services, load throttling).
+
+## Configuration and usage
 
 ### SemaphoreConfig
 
-| Параметр | Тип | По умолчанию | Описание |
-|----------|-----|--------------|----------|
-| `name` | str | required | Логическое имя ресурса. Входит в Redis-ключи, например `semaphore:{name}:owners`. |
-| `limit` | int | required | Максимум одновременных владельцев. Если владельцев `limit`, новый `acquire` вернет `busy`. |
-| `lock_timeout` | float | 30.0 | TTL слота в секундах. Записывается как `score` в owners ZSET и продлевается heartbeat. |
-| `acquire_timeout` | float | None | Максимальное время ожидания при `blocking=True`. `None` — ждать бесконечно. |
-| `retry_interval` | float | 0.1 | Пауза между повторными попытками `acquire` при ожидании. |
-| `refresh_interval` | float | None | Интервал heartbeat. Если не задан, берется 80% от `lock_timeout`. |
-| `namespace` | str | "semaphore" | Префикс Redis-ключей для изоляции окружений/сервисов. |
-| `strict_mode` | bool | False | Если `True`, при потере слота сразу кидает `LockLostError`. |
-| `use_server_time` | bool | False | Если `True`, время берется с Redis (`TIME`). Полезно при рассинхронизации часов между машинами: TTL и очистка просроченных слотов будут согласованы. Минус — один дополнительный сетевой RTT на операции времени. Стоит включать `use_server_time`, если у вас несколько инстансов на разных хостах и нет гарантии синхронизации времени или вы видите преждевременные таймауты или "зависшие" слоты из-за скью часов.|
-| `acquire_mode` | AcquireMode | BLPOP | Стратегия ожидания: `POLLING` (retry loop) или `BLPOP` (эффективное блокирующее ожидание через Redis). |
-| `retry_interval_max` | float | None | Макс. интервал для exponential backoff. `None` — без backoff. |
-| `retry_backoff_multiplier` | float | 2.0 | Множитель для exponential backoff. |
-| `retry_jitter` | float | 0.0 | Случайный jitter как доля интервала (0.0-1.0). Помогает избежать thundering herd. |
-| `blpop_timeout` | float | 5.0 | Таймаут BLPOP перед fallback retry (только для `BLPOP` режима). |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | str | required | Logical resource name. Used in Redis keys, e.g. `semaphore:{name}:owners`. |
+| `limit` | int | required | Maximum number of concurrent owners. Once there are `limit` owners, a new `acquire` returns `busy`. |
+| `lock_timeout` | float | 30.0 | Slot TTL in seconds. Stored as the `score` in the owners ZSET and extended by the heartbeat. |
+| `acquire_timeout` | float | None | Maximum wait time when `blocking=True`. `None` means wait forever. |
+| `retry_interval` | float | 0.1 | Pause between repeated `acquire` attempts while waiting. |
+| `refresh_interval` | float | None | Heartbeat interval. If not set, 80% of `lock_timeout` is used. |
+| `namespace` | str | "semaphore" | Redis key prefix for isolating environments/services. |
+| `strict_mode` | bool | False | If `True`, raises `LockLostError` immediately when the slot is lost. |
+| `use_server_time` | bool | False | If `True`, time is taken from Redis (`TIME`). Useful when clocks drift between machines: TTLs and expired-slot cleanup stay consistent. The downside is one extra network RTT per time operation. Enable `use_server_time` if you run several instances on different hosts with no guaranteed clock sync, or if you observe premature timeouts or "stuck" slots caused by clock skew. |
+| `acquire_mode` | AcquireMode | BLPOP | Wait strategy: `POLLING` (retry loop) or `BLPOP` (efficient blocking wait via Redis). |
+| `retry_interval_max` | float | None | Maximum interval for exponential backoff. `None` means no backoff. |
+| `retry_backoff_multiplier` | float | 2.0 | Multiplier for exponential backoff. |
+| `retry_jitter` | float | 0.0 | Random jitter as a fraction of the interval (0.0–1.0). Helps avoid a thundering herd. |
+| `blpop_timeout` | float | 5.0 | BLPOP timeout before a fallback retry (only for `BLPOP` mode). |
 
 
 
-### Пример конфигурации и как это работает
+### Example configuration and how it works
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig
 
 config = SemaphoreConfig(
     name="payments",
-    limit=5, # максимум 5 параллельных владельцев
-    lock_timeout=30.0, # слот живет 30s без обновления
-    acquire_timeout=None, # ждать бесконечно
-    retry_interval=0.5, # проверять свободный слот каждые 0.5s
-    refresh_interval=24.0, # heartbeat продлевает TTL заранее
-    strict_mode=False, # при потере слота не падаем
+    limit=5, # at most 5 concurrent owners
+    lock_timeout=30.0, # a slot lives for 30s without a refresh
+    acquire_timeout=None, # wait forever
+    retry_interval=0.5, # check for a free slot every 0.5s
+    refresh_interval=24.0, # heartbeat extends the TTL ahead of time
+    strict_mode=False, # don't crash when the slot is lost
 )
 
-# acquire будет ждать слот, проверяя каждые 0.5s.
-# Когда слот получен, heartbeat поддерживает TTL,
-# чтобы запись не истекла в Redis.
+# acquire will wait for a slot, checking every 0.5s.
+# Once a slot is acquired, the heartbeat keeps the TTL alive
+# so the record does not expire in Redis.
 with Semaphore(client, config) as sem:
     do_work()
 ```
 
-### Ручное управление (без контекстного менеджера)
+### Manual management (without a context manager)
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig
@@ -212,7 +246,7 @@ sem = Semaphore(client, config)
 result = sem.acquire(blocking=True)
 if result.success:
     try:
-        sem.refresh()  # продлить TTL вручную, если нужно
+        sem.refresh()  # manually extend the TTL if needed
         do_work()
     finally:
         sem.release()
@@ -220,19 +254,19 @@ else:
     print("Resource busy")
 ```
 
-- `acquire()` возвращает результат попытки захвата.
-- `refresh()` продлевает TTL слота и возвращает `True/False`.
-- `release()` освобождает слот; его важно вызывать в `finally`,
-  чтобы не оставить занятый слот при ошибке в рабочем коде.
+- `acquire()` returns the result of the acquisition attempt.
+- `refresh()` extends the slot TTL and returns `True`/`False`.
+- `release()` frees the slot; it is important to call it in `finally`
+  so you don't leave a slot held if the worker code raises.
 
-### Как работает acquire()
+### How acquire() works
 
-- `blocking=True` включает ожидание слота с интервалом `retry_interval`.
-- `acquire_timeout=None` означает ждать бесконечно (только при `blocking=True`).
-- `blocking=False` делает одну попытку и сразу возвращает `success=False`.
-- `with Semaphore(...)` и `with Mutex(...)` всегда используют `blocking=True`.
+- `blocking=True` enables waiting for a slot, polling at `retry_interval`.
+- `acquire_timeout=None` means wait forever (only when `blocking=True`).
+- `blocking=False` makes a single attempt and returns `success=False` immediately.
+- `with Semaphore(...)` and `with Mutex(...)` always use `blocking=True`.
 
-#### Пример: ожидание слота (blocking)
+#### Example: waiting for a slot (blocking)
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig
@@ -252,15 +286,15 @@ if result.success:
     finally:
         sem.release()
 else:
-    # сюда попадем только если blocking=False
+    # we only reach here if blocking=False
     print("Resource busy")
 ```
 
-Клиент будет ждать слот до 5 секунд, проверяя каждые 0.5 секунды.
-Если слот получен, выполняется `do_work()` и слот освобождается в `finally`.
-Если бы мы использовали `blocking=False`, код сразу бы пошел в ветку `else`.
+The client will wait for a slot for up to 5 seconds, checking every 0.5 seconds.
+If a slot is acquired, `do_work()` runs and the slot is released in `finally`.
+Had we used `blocking=False`, the code would have gone straight to the `else` branch.
 
-#### Пример: один быстрый запрос (non-blocking)
+#### Example: a single quick attempt (non-blocking)
 
 ```python
 result = mutex.acquire(blocking=False)
@@ -273,38 +307,38 @@ else:
     print("Resource busy")
 ```
 
-`acquire` делает одну попытку и сразу возвращает результат.
-Если слот занят, код не ждет и сразу переходит в ветку `else`.
+`acquire` makes a single attempt and returns immediately.
+If the slot is taken, the code does not wait and goes straight to the `else` branch.
 
 
-### Стратегии ожидания (AcquireMode)
+### Wait strategies (AcquireMode)
 
-При `blocking=True` семафор ждёт освобождения слота. Есть две стратегии:
+When `blocking=True`, the semaphore waits for a slot to free up. There are two strategies:
 
-#### BLPOP (по умолчанию)
+#### BLPOP (default)
 
-Использует Redis `BLPOP` для блокирующего ожидания уведомления.
-При `release()` публикуется сигнал, пробуждающий ожидающего клиента.
+Uses Redis `BLPOP` to block until notified. On `release()`, a signal is published
+that wakes a waiting client.
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig
 
-# BLPOP используется по умолчанию
+# BLPOP is used by default
 config = SemaphoreConfig(
     name="jobs",
     limit=5,
-    blpop_timeout=5.0,  # fallback polling каждые 5 сек
+    blpop_timeout=5.0,  # fallback polling every 5 seconds
 )
 ```
 
-**Преимущества BLPOP:**
-- Минимальная нагрузка на Redis (нет постоянных запросов)
-- Мгновенное пробуждение при освобождении слота
-- Очередь ожидания не хранится явно — BLPOP служит только сигналом пробуждения
+**Advantages of BLPOP:**
+- Minimal load on Redis (no constant polling)
+- Instant wake-up when a slot is freed
+- The wait queue is not stored explicitly — BLPOP serves only as a wake-up signal
 
 #### POLLING
 
-Простой retry loop с паузой `retry_interval` между попытками.
+A simple retry loop with a `retry_interval` pause between attempts.
 
 ```python
 from redis_semaphore import Semaphore, SemaphoreConfig, AcquireMode
@@ -313,33 +347,33 @@ config = SemaphoreConfig(
     name="jobs",
     limit=5,
     acquire_mode=AcquireMode.POLLING,
-    retry_interval=0.1,  # проверять каждые 100ms
+    retry_interval=0.1,  # check every 100ms
 )
 ```
 
-**С exponential backoff и jitter:**
+**With exponential backoff and jitter:**
 
 ```python
 config = SemaphoreConfig(
     name="jobs",
     limit=5,
     acquire_mode=AcquireMode.POLLING,
-    retry_interval=0.1,         # начальный интервал
-    retry_interval_max=2.0,     # максимальный интервал
-    retry_backoff_multiplier=2.0,  # удваиваем каждый цикл
-    retry_jitter=0.1,           # ±10% случайный jitter
+    retry_interval=0.1,         # initial interval
+    retry_interval_max=2.0,     # maximum interval
+    retry_backoff_multiplier=2.0,  # double every cycle
+    retry_jitter=0.1,           # ±10% random jitter
 )
 ```
 
-Backoff полезен для снижения нагрузки на Redis при длительном ожидании.
-Jitter помогает избежать thundering herd, когда много клиентов ждут одновременно.
+Backoff is useful for reducing load on Redis during long waits.
+Jitter helps avoid a thundering herd when many clients wait at the same time.
 
-**Когда выбирать POLLING:**
-- Простые случаи с коротким ожиданием
-- Совместимость со старыми версиями Redis
+**When to choose POLLING:**
+- Simple cases with short waits
+- Compatibility with older Redis versions
 
 
-### Обработка потери блокировки
+### Handling lock loss
 
 ```python
 def on_lock_lost(identifier: str):
@@ -354,18 +388,18 @@ sem_cfg = SemaphoreConfig(name="critical-pool", limit=2)
 semaphore = Semaphore(client, sem_cfg, on_lock_lost=on_lock_lost)
 ```
 
-Что происходит в этом примере:
-- При потере слота (например, TTL истек) вызывается `on_lock_lost`.
-- В колбэке можно инициировать корректное завершение работы.
+What happens in this example:
+- When the slot is lost (e.g. the TTL expired), `on_lock_lost` is invoked.
+- In the callback you can trigger a graceful shutdown.
 
-### Async методы
+### Async methods
 
-Асинхронные методы используют префикс `a`:
+Async methods use the `a` prefix:
 
 - `aacquire` / `arelease` / `arefresh`
-- `__aenter__` / `__aexit__` (через `async with`)
+- `__aenter__` / `__aexit__` (via `async with`)
 
-Пример:
+Example:
 
 ```python
 import redis.asyncio as aioredis
@@ -381,7 +415,7 @@ async def main():
     await client.aclose()
 ```
 
-Также можно использовать явные async-методы без `async with`:
+You can also use the explicit async methods without `async with`:
 
 ```python
 import redis.asyncio as aioredis
@@ -401,11 +435,11 @@ async def main():
     await client.aclose()
 ```
 
-## Логирование
+## Logging
 
-По умолчанию используется стандартный `logging` с именем `redis_semaphore`.
+By default the standard `logging` module is used with the logger name `redis_semaphore`.
 
-Можно заменить логгер на свой (например loguru или structlog):
+You can swap in your own logger (e.g. loguru or structlog):
 
 ```python
 from redis_semaphore import set_logger
@@ -419,45 +453,45 @@ import structlog
 set_logger(structlog.get_logger("redis_semaphore"))
 ```
 
-## Метрики
+## Metrics
 
-Prometheus-метрики опциональны. Установить:
+Prometheus metrics are optional. To install:
 
 ```bash
 pip install "py-redis-semaphore[prometheus]"
 ```
 
-Пример использования:
+Example usage:
 
 ```python
 from prometheus_client import REGISTRY
 from redis_semaphore import PrometheusMetrics, set_metrics
 
-# Регистрируем метрики в существующем registry приложения
+# Register the metrics in the application's existing registry
 set_metrics(PrometheusMetrics(registry=REGISTRY))
 ```
 
-## Примеры
+## Examples
 
-Смотри `examples/basic_usage.py` (sync/async примеры) и
-`examples/multiprocess_simulation.py` (имитация работы нескольких процессов).
+See `examples/basic_usage.py` (sync/async examples) and
+`examples/multiprocess_simulation.py` (a simulation of several processes).
 
-Запуск:
+Run them with:
 
 ```bash
 python examples/basic_usage.py
 python examples/multiprocess_simulation.py
 ```
 
-## Подробнее о работе семафора
+## More about how the semaphore works
 
-Смотри `docs/SEMAPHORE.md` (человеческое объяснение) и `docs/ALGORITHM.md`
-(алгоритм и детали реализации).
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) — a step-by-step walkthrough of the
+algorithm and implementation details.
 
-## Документация для разработчика
+## Developer documentation
 
-Смотри `docs/DEVELOPMENT.md`.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Лицензия
+## License
 
 MIT

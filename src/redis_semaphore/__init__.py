@@ -45,6 +45,15 @@ Important notes:
     - Fencing tokens: Each acquire() returns a monotonically increasing fencing
       token that can be used to detect stale operations. Pass this token to
       downstream services to reject out-of-order writes.
+
+    - Lock loss on connection failure: The heartbeat tolerates transient Redis
+      connection errors and keeps retrying at refresh_retry_interval. If the
+      lock cannot be refreshed for lock_timeout seconds (the server-side TTL),
+      it is treated as lost: on_lock_lost fires and, in strict_mode, the next
+      operation raises LockLostError. To guarantee timely detection, keep the
+      client's socket_timeout (or connection timeout) smaller than lock_timeout,
+      otherwise a single hung refresh attempt can delay escalation past the
+      deadline.
 """
 
 from .connection import (
@@ -55,13 +64,16 @@ from .connection import (
 from .errors import (
     AcquireError,
     AcquireTimeoutError,
+    BackendError,
+    CommandDeniedError,
     LockLostError,
     MixedModeError,
     NotAcquiredError,
+    PermanentBackendError,
     RedisConnectionError,
     RedisSemaphoreError,
-    RefreshError,
     ReleaseError,
+    TransientBackendError,
 )
 from .logger import logger, set_logger
 from .metrics import PrometheusMetrics, set_metrics
@@ -71,9 +83,10 @@ from .types import (
     AcquireResult,
     LockState,
     SemaphoreConfig,
+    SemaphoreStatus,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     # Config types
@@ -82,6 +95,7 @@ __all__ = [
     "LockState",
     "RedisConfig",
     "SemaphoreConfig",
+    "SemaphoreStatus",
     "SentinelConfig",
     # Connection
     "RedisConnectionFactory",
@@ -93,13 +107,16 @@ __all__ = [
     # Errors
     "AcquireError",
     "AcquireTimeoutError",
+    "BackendError",
+    "CommandDeniedError",
     "LockLostError",
     "MixedModeError",
     "NotAcquiredError",
+    "PermanentBackendError",
     "RedisConnectionError",
     "RedisSemaphoreError",
-    "RefreshError",
     "ReleaseError",
+    "TransientBackendError",
     # Logging & Metrics
     "PrometheusMetrics",
     "logger",
