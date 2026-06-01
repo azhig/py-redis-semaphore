@@ -255,3 +255,4 @@ Semaphore 'payments' full 2/2; waiting=1
 
 - `usage 2/2` — total slots taken in Redis
 - `waiting=1` — local to the current process
+
