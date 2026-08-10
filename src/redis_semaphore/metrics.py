@@ -64,7 +64,13 @@ def get_metrics() -> MetricsCollector:
 
 
 class PrometheusMetrics:
-    """Prometheus metrics collector."""
+    """Prometheus metrics collector.
+
+    Note on gauges: ``redis_semaphore_slots_used`` is each process's *last
+    observation* of the shared server-side occupancy. When several processes
+    export to separate registries the values may briefly disagree - aggregate
+    with ``max`` (not ``sum``) across instances.
+    """
 
     def __init__(self, registry=None, buckets=None) -> None:
         from prometheus_client import Counter, Gauge, Histogram

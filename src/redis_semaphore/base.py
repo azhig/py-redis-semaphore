@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Generic, TypeVar
 
 from .lua_scripts import LuaScriptRegistry
-from .types import LockState, SemaphoreConfig
+from .types import LockState, SemaphoreConfig, TimeSource
 
 ClientT = TypeVar("ClientT")
 
@@ -53,9 +53,11 @@ class BaseSemaphoreCommon(Generic[ClientT]):
         self._state = LockState.RELEASED
         self._acquire_mode = _AcquireMode.NONE
 
-        # Calculate refresh_interval
+        # Calculate refresh_interval. One third of the TTL leaves roughly two
+        # thirds of lock_timeout as retry budget when Redis is briefly
+        # unreachable (at 80% a single failed refresh nearly exhausted it).
         if config.refresh_interval is None:
-            self._refresh_interval = config.lock_timeout * 0.8
+            self._refresh_interval = config.lock_timeout / 3
         else:
             self._refresh_interval = config.refresh_interval
 
@@ -66,19 +68,29 @@ class BaseSemaphoreCommon(Generic[ClientT]):
             self._refresh_retry_interval = config.refresh_retry_interval
 
     @property
+    def _key_prefix(self) -> str:
+        """Common key prefix; with cluster_hash_tags the whole prefix becomes
+        a hash tag so all keys of one semaphore map to the same Cluster slot
+        (multi-key scripts require this)."""
+        prefix = f"{self._config.namespace}:{self._config.name}"
+        if self._config.cluster_hash_tags:
+            return "{" + prefix + "}"
+        return prefix
+
+    @property
     def owners_key(self) -> str:
         """Redis key for the owners sorted set."""
-        return f"{self._config.namespace}:{self._config.name}:owners"
+        return f"{self._key_prefix}:owners"
 
     @property
     def fencing_key(self) -> str:
         """Redis key for the fencing token."""
-        return f"{self._config.namespace}:{self._config.name}:fencing"
+        return f"{self._key_prefix}:fencing"
 
     @property
     def queue_key(self) -> str:
         """Redis key for the notification queue (used in BLPOP mode)."""
-        return f"{self._config.namespace}:{self._config.name}:queue"
+        return f"{self._key_prefix}:queue"
 
     @property
     def identifier(self) -> str | None:
@@ -113,17 +125,14 @@ class BaseSemaphoreCommon(Generic[ClientT]):
         """Get current time in milliseconds (client-side)."""
         return int(time.time() * 1000)
 
-    def _get_server_time_ms(self) -> int:
-        """Get Redis server time in milliseconds.
+    def _now_ms_arg(self) -> int | str:
+        """Time argument for the Lua scripts.
 
-        Uses TIME command which returns [seconds, microseconds].
+        Client milliseconds in TimeSource.CLIENT mode; the empty string in
+        TimeSource.SERVER mode, which tells the script to read TIME on the
+        server. Never needs a network round-trip, so the same sync method
+        serves both the sync and async paths.
         """
-        result = self._client.time()  # type: ignore[attr-defined]
-        seconds, microseconds = result
-        return int(seconds) * 1000 + int(microseconds) // 1000
-
-    async def _get_server_time_ms_async(self) -> int:
-        """Get Redis server time in milliseconds (async)."""
-        result = await self._client.time()  # type: ignore[attr-defined]
-        seconds, microseconds = result
-        return int(seconds) * 1000 + int(microseconds) // 1000
+        if self._config.time_source is TimeSource.SERVER:
+            return ""
+        return self._get_current_time_ms()

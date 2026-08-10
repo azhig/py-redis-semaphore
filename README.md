@@ -171,12 +171,17 @@ than the last one seen. This way safety is enforced on the resource side rather
 than by trusting the lock itself — it is the only correct way to protect against
 double ownership during failover and against GC pauses.
 
-**Clocks.** TTLs are computed using client-side time. NTP synchronization between
-clients is required; a clock skew of a few seconds breaks lock expiration.
+**Clocks.** By default (`time_source=TimeSource.SERVER`) all timestamps are read
+on the Redis server *inside* the Lua scripts, so clients do **not** need
+synchronized clocks and no extra round-trip is paid. Only with
+`time_source=TimeSource.CLIENT` (needed for Redis servers older than 3.2) are
+TTLs computed from client-side time — then NTP synchronization between clients
+is required, and a clock skew of a few seconds breaks lock expiration.
 
 **Timeliness of loss detection.** Keep the client `socket_timeout` smaller than
 `lock_timeout`, otherwise a single stalled refresh can delay lock-loss escalation
-past the deadline.
+past the deadline. (BLPOP waits are automatically capped below `socket_timeout`,
+so a blocking `acquire` never trips over the socket read timeout.)
 
 Bottom line: for task coordination, rate limiting, and pools where the resource
 verifies a fencing token, the library is production-ready. For scenarios that
@@ -201,15 +206,19 @@ during failover, you need a different mechanism (e.g. a consensus store).
 | `lock_timeout` | float | 30.0 | Slot TTL in seconds. Stored as the `score` in the owners ZSET and extended by the heartbeat. |
 | `acquire_timeout` | float | None | Maximum wait time when `blocking=True`. `None` means wait forever. |
 | `retry_interval` | float | 0.1 | Pause between repeated `acquire` attempts while waiting. |
-| `refresh_interval` | float | None | Heartbeat interval. If not set, 80% of `lock_timeout` is used. |
+| `refresh_interval` | float | None | Heartbeat interval. If not set, `lock_timeout / 3` is used, leaving ~2/3 of the TTL as retry budget when Redis is briefly unreachable. |
 | `namespace` | str | "semaphore" | Redis key prefix for isolating environments/services. |
 | `strict_mode` | bool | False | If `True`, raises `LockLostError` immediately when the slot is lost. |
-| `use_server_time` | bool | False | If `True`, time is taken from Redis (`TIME`). Useful when clocks drift between machines: TTLs and expired-slot cleanup stay consistent. The downside is one extra network RTT per time operation. Enable `use_server_time` if you run several instances on different hosts with no guaranteed clock sync, or if you observe premature timeouts or "stuck" slots caused by clock skew. |
+| `time_source` | TimeSource | SERVER | Where "now" comes from. `SERVER` (default): read via `TIME` inside the Lua scripts — clients share the Redis clock, no NTP sync needed, no extra RTT. `CLIENT`: client-side timestamps (requires NTP-synchronized clients); only needed for Redis servers older than 3.2. |
+| `use_server_time` | bool | False | **Deprecated** alias for `time_source=TimeSource.SERVER` (which is now the default). Emits a `DeprecationWarning`. |
 | `acquire_mode` | AcquireMode | BLPOP | Wait strategy: `POLLING` (retry loop) or `BLPOP` (efficient blocking wait via Redis). |
 | `retry_interval_max` | float | None | Maximum interval for exponential backoff. `None` means no backoff. |
-| `retry_backoff_multiplier` | float | 2.0 | Multiplier for exponential backoff. |
-| `retry_jitter` | float | 0.0 | Random jitter as a fraction of the interval (0.0–1.0). Helps avoid a thundering herd. |
-| `blpop_timeout` | float | 5.0 | BLPOP timeout before a fallback retry (only for `BLPOP` mode). |
+| `retry_backoff_multiplier` | float | 2.0 | Multiplier for exponential backoff; the exponent is the number of completed wait rounds. |
+| `retry_jitter` | float | 0.1 | Random jitter as a fraction of the interval (0.0–1.0). Helps avoid a thundering herd. |
+| `blpop_timeout` | float | 5.0 | BLPOP timeout before a fallback retry (only for `BLPOP` mode). At runtime each wait is additionally capped below the client's `socket_timeout` to avoid spurious read timeouts. |
+| `refresh_retry_interval` | float | None | Heartbeat retry cadence after a transient connection error. If not set, `min(refresh_interval, 1.0)`. |
+| `cluster_hash_tags` | bool | False | Format keys as `{namespace:name}:owners` etc. so all keys of one semaphore map to a single Redis Cluster slot. **Changes key names** — do not flip on an existing deployment without draining it first. |
+| `reacquire_policy` | ReacquirePolicy | RENEW | What `acquire()` does when this instance already holds a slot. `RENEW`: refresh the TTL and issue a **new** fencing token (the previously returned token becomes stale; there is no hold count — one `release()` frees the slot). `FORBID`: raise `AlreadyAcquiredError` instead. |
 
 
 
@@ -335,6 +344,14 @@ config = SemaphoreConfig(
 - Minimal load on Redis (no constant polling)
 - Instant wake-up when a slot is freed
 - The wait queue is not stored explicitly — BLPOP serves only as a wake-up signal
+
+Ordering is **approximately FIFO**: blocked clients are woken in BLPOP order,
+but a freshly arriving client that calls `acquire()` at the right moment can
+still win the race for the freed slot against a woken waiter.
+
+The wait phase tolerates transient backend errors (a socket read timeout, a
+connection blip): they are treated as a spurious wake-up and the wait resumes.
+A real outage still surfaces as a `BackendError` from the next acquire attempt.
 
 #### POLLING
 

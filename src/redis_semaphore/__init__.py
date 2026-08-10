@@ -34,10 +34,12 @@ Sentinel support:
     client = RedisConnectionFactory.create_sync(config)
 
 Important notes:
-    - Clock synchronization: This library uses client-side timestamps for TTL
-      calculations. Ensure all clients are NTP-synchronized to avoid issues
-      with lock expiration. A clock skew of more than a few seconds between
-      clients can cause unexpected lock behavior.
+    - Clock synchronization: By default (time_source=TimeSource.SERVER) all
+      timestamps are read on the Redis server inside the Lua scripts, so
+      clients do NOT need synchronized clocks. Only with
+      time_source=TimeSource.CLIENT (needed for Redis servers older than 3.2)
+      must all clients be NTP-synchronized: a clock skew of more than a few
+      seconds between clients breaks lock expiration.
 
     - Do not mix sync/async APIs: Use acquire()/release() OR aacquire()/arelease()
       on the same Semaphore instance, but not both. Mixing will raise MixedModeError.
@@ -64,6 +66,7 @@ from .connection import (
 from .errors import (
     AcquireError,
     AcquireTimeoutError,
+    AlreadyAcquiredError,
     BackendError,
     CommandDeniedError,
     LockLostError,
@@ -82,8 +85,10 @@ from .types import (
     AcquireMode,
     AcquireResult,
     LockState,
+    ReacquirePolicy,
     SemaphoreConfig,
     SemaphoreStatus,
+    TimeSource,
 )
 
 __version__ = "0.1.1"
@@ -93,10 +98,12 @@ __all__ = [
     "AcquireMode",
     "AcquireResult",
     "LockState",
+    "ReacquirePolicy",
     "RedisConfig",
     "SemaphoreConfig",
     "SemaphoreStatus",
     "SentinelConfig",
+    "TimeSource",
     # Connection
     "RedisConnectionFactory",
     # Primitives
@@ -107,6 +114,7 @@ __all__ = [
     # Errors
     "AcquireError",
     "AcquireTimeoutError",
+    "AlreadyAcquiredError",
     "BackendError",
     "CommandDeniedError",
     "LockLostError",

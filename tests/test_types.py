@@ -2,7 +2,7 @@
 
 import pytest
 
-from redis_semaphore import SemaphoreConfig
+from redis_semaphore import AcquireMode, ReacquirePolicy, SemaphoreConfig, TimeSource
 
 
 def test_config_validation_name_required():
@@ -44,13 +44,15 @@ def test_config_strict_mode():
     assert config_default.strict_mode is False
 
 
-def test_config_use_server_time():
-    """Test use_server_time configuration option."""
-    config = SemaphoreConfig(name="server-time", limit=1, use_server_time=True)
-    assert config.use_server_time is True
+def test_config_use_server_time_deprecated():
+    """use_server_time still works but warns; server time is the default."""
+    with pytest.deprecated_call():
+        config = SemaphoreConfig(name="server-time", limit=1, use_server_time=True)
+    assert config.time_source is TimeSource.SERVER
 
     config_default = SemaphoreConfig(name="default", limit=1)
     assert config_default.use_server_time is False
+    assert config_default.time_source is TimeSource.SERVER
 
 
 def test_config_mission_critical():
@@ -59,7 +61,15 @@ def test_config_mission_critical():
         name="critical",
         limit=1,
         strict_mode=True,
-        use_server_time=True,
     )
     assert config.strict_mode is True
-    assert config.use_server_time is True
+    assert config.time_source is TimeSource.SERVER
+
+
+def test_config_new_defaults():
+    """Defaults introduced in 0.2: jitter, BLPOP mode, RENEW policy."""
+    config = SemaphoreConfig(name="defaults", limit=1)
+    assert config.retry_jitter == 0.1
+    assert config.acquire_mode is AcquireMode.BLPOP
+    assert config.reacquire_policy is ReacquirePolicy.RENEW
+    assert config.cluster_hash_tags is False

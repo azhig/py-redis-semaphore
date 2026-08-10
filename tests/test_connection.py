@@ -79,6 +79,41 @@ async def test_create_async_direct():
     await client.aclose()
 
 
+def test_client_kwargs_optional_params():
+    """Optional production params reach the client's connection kwargs."""
+    config = RedisConfig(
+        host="localhost",
+        port=_redis_port(),
+        client_name="sem-test",
+        health_check_interval=10.0,
+        socket_connect_timeout=2.0,
+    )
+    client = RedisConnectionFactory.create_sync(config)
+    kwargs = client.get_connection_kwargs()
+    assert kwargs["client_name"] == "sem-test"
+    assert kwargs["health_check_interval"] == 10.0
+    assert kwargs["socket_connect_timeout"] == 2.0
+    client.close()
+
+
+def test_client_kwargs_ssl():
+    """ssl=True switches the pool to an SSL connection class (no connect)."""
+    ca_path = "/etc/ssl/certs/test-ca.pem"  # never opened: the client is lazy
+    config = RedisConfig(ssl=True, ssl_ca_certs=ca_path, ssl_cert_reqs="none")
+    client = RedisConnectionFactory.create_sync(config)
+    assert "SSL" in client.connection_pool.connection_class.__name__
+    assert client.get_connection_kwargs()["ssl_ca_certs"] == ca_path
+    client.close()
+
+
+def test_client_extra_kwargs_override():
+    """extra_kwargs is an escape hatch that wins over the named fields."""
+    config = RedisConfig(socket_timeout=5.0, extra_kwargs={"socket_timeout": 1.5})
+    client = RedisConnectionFactory.create_sync(config)
+    assert client.get_connection_kwargs()["socket_timeout"] == 1.5
+    client.close()
+
+
 def test_create_sync_sentinel():
     """Factory creates a sentinel sync client."""
     config = _sentinel_config()
