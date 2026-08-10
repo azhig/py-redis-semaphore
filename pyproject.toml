@@ -1,6 +1,6 @@
 [project]
 name = "py-redis-semaphore"
-version = "0.1.1"
+version = "0.2.0"
 description = "Distributed semaphore and mutex with Redis and Sentinel support"
 readme = "README.md"
 license = "MIT"
