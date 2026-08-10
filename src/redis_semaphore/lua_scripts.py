@@ -18,6 +18,40 @@ from typing import ClassVar, Protocol, TypeAlias
 import redis
 import redis.asyncio as aioredis
 
+
+def _lua_resolve_now(argv_index: int) -> str:
+    """Lua fragment: take now_ms from ARGV, or read it on the server.
+
+    An empty-string ARGV (``tonumber`` -> nil) selects server time: the script
+    calls TIME so every client shares the Redis clock and no NTP sync between
+    clients is needed. ``redis.replicate_commands()`` switches Redis 3.2-6.x
+    to effect replication, which is required to call TIME from a script; on
+    Redis 7+ it is a harmless no-op.
+    """
+    return f"""
+local now_ms = tonumber(ARGV[{argv_index}])
+if not now_ms then
+    if redis.replicate_commands then redis.replicate_commands() end
+    local t = redis.call('TIME')
+    now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
+"""
+
+
+# Lua fragment: expire the owners key together with its longest-lived member,
+# so abandoned semaphores do not leave keys behind forever. Uses the top ZSET
+# score (members may have different lock_timeouts) plus one lock_timeout of
+# margin to absorb client/server clock difference in client-time mode.
+# Requires owners_key, now_ms and lock_timeout_ms in scope.
+_LUA_BUMP_OWNERS_TTL = """
+    local top = redis.call('ZRANGE', owners_key, -1, -1, 'WITHSCORES')
+    local max_expires = tonumber(top[2])
+    if max_expires then
+        redis.call('PEXPIRE', owners_key, math.floor(max_expires - now_ms + lock_timeout_ms))
+    end
+"""
+
+
 # =============================================================================
 # ACQUIRE - Acquire a semaphore slot
 # =============================================================================
@@ -26,20 +60,22 @@ import redis.asyncio as aioredis
 # ARGV[1] = identifier (unique owner id)
 # ARGV[2] = limit (max concurrent holders)
 # ARGV[3] = lock_timeout_ms (TTL in milliseconds)
-# ARGV[4] = current_time_ms (current timestamp in milliseconds)
+# ARGV[4] = current_time_ms, or '' to use server time (TIME inside the script)
 #
 # Returns: [success (0/1), fencing_token or nil, expires_at_ms or nil, used_slots]
 #   used_slots is the occupancy observed atomically by this call (including the
 #   caller on success). It lets the client feed metrics/logs without a separate
 #   status round-trip.
-ACQUIRE_SCRIPT = """
+ACQUIRE_SCRIPT = (
+    """
 local owners_key = KEYS[1]
 local fencing_key = KEYS[2]
 local identifier = ARGV[1]
 local limit = tonumber(ARGV[2])
 local lock_timeout_ms = tonumber(ARGV[3])
-local now_ms = tonumber(ARGV[4])
-
+"""
+    + _lua_resolve_now(4)
+    + """
 -- 1. Cleanup: remove expired entries (score < now)
 redis.call('ZREMRANGEBYSCORE', owners_key, '-inf', now_ms)
 
@@ -54,6 +90,9 @@ if existing_score then
     local new_expires = now_ms + lock_timeout_ms
     redis.call('ZADD', owners_key, new_expires, identifier)
     local fencing_token = redis.call('INCR', fencing_key)
+"""
+    + _LUA_BUMP_OWNERS_TTL
+    + """
     return {1, fencing_token, new_expires, current_count}
 end
 
@@ -64,13 +103,16 @@ if current_count < limit then
 
     -- 5. Increment and get fencing token
     local fencing_token = redis.call('INCR', fencing_key)
-
+"""
+    + _LUA_BUMP_OWNERS_TTL
+    + """
     return {1, fencing_token, expires_at, current_count + 1}
 else
     -- 6. No slots available
     return {0, '', '', current_count}
 end
 """
+)
 
 
 # =============================================================================
@@ -96,15 +138,19 @@ return removed
 # KEYS[1] = owners sorted set key
 # ARGV[1] = identifier
 # ARGV[2] = lock_timeout_ms
-# ARGV[3] = current_time_ms
+# ARGV[3] = current_time_ms, or '' to use server time (TIME inside the script)
 #
-# Returns: 1 if refreshed, 0 if not owned (lock lost)
-REFRESH_SCRIPT = """
+# Returns: new absolute expiry in ms if refreshed, 0 if not owned (lock lost).
+#   Returning the expiry (rather than a bare 1) lets the client track it
+#   without knowing "now" in server-time mode.
+REFRESH_SCRIPT = (
+    """
 local owners_key = KEYS[1]
 local identifier = ARGV[1]
 local lock_timeout_ms = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-
+"""
+    + _lua_resolve_now(3)
+    + """
 -- Check if we own the lock
 local current_score = redis.call('ZSCORE', owners_key, identifier)
 
@@ -122,38 +168,47 @@ end
 -- Update TTL
 local new_expires = now_ms + lock_timeout_ms
 redis.call('ZADD', owners_key, 'XX', new_expires, identifier)
-return 1
 """
+    + _LUA_BUMP_OWNERS_TTL
+    + """
+return new_expires
+"""
+)
 
 
 # =============================================================================
 # CLEANUP - Force cleanup of expired locks
 # =============================================================================
 # KEYS[1] = owners sorted set key
-# ARGV[1] = current_time_ms
+# ARGV[1] = current_time_ms, or '' to use server time (TIME inside the script)
 #
 # Returns: number of removed entries
-CLEANUP_SCRIPT = """
+CLEANUP_SCRIPT = (
+    """
 local owners_key = KEYS[1]
-local now_ms = tonumber(ARGV[1])
-
+"""
+    + _lua_resolve_now(1)
+    + """
 return redis.call('ZREMRANGEBYSCORE', owners_key, '-inf', now_ms)
 """
+)
 
 
 # =============================================================================
 # STATUS - Get current semaphore status
 # =============================================================================
 # KEYS[1] = owners sorted set key
-# ARGV[1] = current_time_ms
+# ARGV[1] = current_time_ms, or '' to use server time (TIME inside the script)
 # ARGV[2] = identifier (optional, to check ownership)
 #
 # Returns: [current_count, is_owner (0/1), expires_at or nil]
-STATUS_SCRIPT = """
+STATUS_SCRIPT = (
+    """
 local owners_key = KEYS[1]
-local now_ms = tonumber(ARGV[1])
 local identifier = ARGV[2]
-
+"""
+    + _lua_resolve_now(1)
+    + """
 -- Cleanup expired
 redis.call('ZREMRANGEBYSCORE', owners_key, '-inf', now_ms)
 
@@ -171,6 +226,7 @@ end
 
 return {current_count, is_owner, expires_at}
 """
+)
 
 
 class LuaScriptRegistry:
@@ -222,7 +278,7 @@ class LuaScriptRunner:
         identifier: str,
         limit: int,
         lock_timeout_ms: int,
-        now_ms: int,
+        now_ms: int | str,
     ) -> tuple[bool, int | None, int | None, int]:
         result: object = client.evalsha(
             self._registry.get_sha("acquire"),
@@ -251,8 +307,9 @@ class LuaScriptRunner:
         owners_key: str,
         identifier: str,
         lock_timeout_ms: int,
-        now_ms: int,
-    ) -> bool:
+        now_ms: int | str,
+    ) -> int:
+        """Refresh the slot TTL; returns the new expiry in ms, or 0 if lost."""
         result: object = client.evalsha(
             self._registry.get_sha("refresh"),
             1,
@@ -261,7 +318,7 @@ class LuaScriptRunner:
             lock_timeout_ms,
             now_ms,
         )
-        return bool(result)
+        return _to_int(result)
 
     async def acquire_async(
         self,
@@ -271,7 +328,7 @@ class LuaScriptRunner:
         identifier: str,
         limit: int,
         lock_timeout_ms: int,
-        now_ms: int,
+        now_ms: int | str,
     ) -> tuple[bool, int | None, int | None, int]:
         result: object = await client.aevalsha(
             self._registry.get_sha("acquire"),
@@ -300,8 +357,9 @@ class LuaScriptRunner:
         owners_key: str,
         identifier: str,
         lock_timeout_ms: int,
-        now_ms: int,
-    ) -> bool:
+        now_ms: int | str,
+    ) -> int:
+        """Async variant of :meth:`refresh`; returns new expiry ms, or 0 if lost."""
         result: object = await client.aevalsha(
             self._registry.get_sha("refresh"),
             1,
@@ -310,9 +368,9 @@ class LuaScriptRunner:
             lock_timeout_ms,
             now_ms,
         )
-        return bool(result)
+        return _to_int(result)
 
-    def cleanup(self, client: ScriptClient, owners_key: str, now_ms: int) -> int:
+    def cleanup(self, client: ScriptClient, owners_key: str, now_ms: int | str) -> int:
         result: object = client.evalsha(
             self._registry.get_sha("cleanup"),
             1,
@@ -321,7 +379,7 @@ class LuaScriptRunner:
         )
         return _to_int(result)
 
-    async def cleanup_async(self, client: ScriptClient, owners_key: str, now_ms: int) -> int:
+    async def cleanup_async(self, client: ScriptClient, owners_key: str, now_ms: int | str) -> int:
         result: object = await client.aevalsha(
             self._registry.get_sha("cleanup"),
             1,
@@ -334,7 +392,7 @@ class LuaScriptRunner:
         self,
         client: ScriptClient,
         owners_key: str,
-        now_ms: int,
+        now_ms: int | str,
         identifier: str | None,
     ) -> tuple[int, bool, int | None]:
         result: object = client.evalsha(
@@ -350,7 +408,7 @@ class LuaScriptRunner:
         self,
         client: ScriptClient,
         owners_key: str,
-        now_ms: int,
+        now_ms: int | str,
         identifier: str | None,
     ) -> tuple[int, bool, int | None]:
         result: object = await client.aevalsha(

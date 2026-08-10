@@ -63,10 +63,13 @@ def test_cleanup_removes_expired_entries(redis_client):
     redis_client.delete(owners_key)
 
     now_ms = int(time.time() * 1000)
-    # Two already-expired members and one far in the future.
+    # Two already-expired members and one far in the future. Margins are much
+    # larger than any client/server clock difference: cleanup() judges expiry
+    # by the Redis server clock (TimeSource.SERVER), while these fixtures are
+    # seeded with the client clock.
     redis_client.zadd(
         owners_key,
-        {"dead-1": now_ms - 10_000, "dead-2": now_ms - 1, "alive": now_ms + 60_000},
+        {"dead-1": now_ms - 10_000, "dead-2": now_ms - 2_000, "alive": now_ms + 60_000},
     )
 
     sem = Semaphore(redis_client, config)

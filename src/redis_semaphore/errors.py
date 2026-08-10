@@ -20,6 +20,13 @@ class AcquireTimeoutError(AcquireError):
     """Timeout while trying to acquire lock."""
 
 
+class AlreadyAcquiredError(AcquireError):
+    """acquire() called on an instance that already holds a slot.
+
+    Raised only with ``reacquire_policy=ReacquirePolicy.FORBID``.
+    """
+
+
 class ReleaseError(RedisSemaphoreError):
     """Error while releasing lock."""
 

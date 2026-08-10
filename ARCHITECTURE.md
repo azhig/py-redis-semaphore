@@ -212,14 +212,30 @@ limit=2, processes A, B, C:
 
 ---
 
-## 9) Time: client-side or server-side
+## 9) Time: server-side or client-side
 
-By default, client-side time (`time.time()`) is used.
-You can enable `use_server_time=True`, and time will be taken from Redis (`TIME`).
+By default (`time_source=TimeSource.SERVER`), "now" is read via `TIME` *inside*
+the Lua scripts. Every client therefore shares the Redis server clock:
 
-Why this is needed:
-- If clocks on different machines drift, server-side time is more reliable.
-- The downside: an extra network RTT.
+- No NTP synchronization between clients is required.
+- No extra network round-trip is paid (the read happens within the script).
+- Requires Redis >= 3.2 (the scripts call `redis.replicate_commands()`; on
+  Redis 7+ effect replication is always on and the call is a no-op).
+
+`time_source=TimeSource.CLIENT` switches to client-side `time.time()` — only
+needed for very old Redis servers. In that mode all clients must be
+NTP-synchronized: a clock skew of a few seconds breaks lock expiration.
+
+The old `use_server_time=True` flag (which fetched `TIME` with a separate
+round-trip) is deprecated and now simply means `TimeSource.SERVER`.
+
+### Key hygiene
+
+Acquire/refresh set a TTL on the `owners` key (from the longest-lived member,
+plus one `lock_timeout` of margin), and release sets a TTL on the notification
+`queue` key. Abandoned semaphore names therefore clean themselves up. The
+`fencing` counter intentionally has **no** TTL: expiring it would reset token
+monotonicity.
 
 ---
 

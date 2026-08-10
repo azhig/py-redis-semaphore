@@ -1,5 +1,8 @@
 """Tests for mixed sync/async mode handling and lock-lost waits."""
 
+import asyncio
+import time
+
 import pytest
 
 from redis_semaphore import AcquireMode, MixedModeError, Semaphore, SemaphoreConfig
@@ -91,3 +94,22 @@ async def test_await_lock_lost_true(async_redis_client):
     sem._lock_lost_event.set()
 
     assert await sem.await_lock_lost(timeout=0.1) is True
+
+
+@pytest.mark.asyncio
+async def test_await_lock_lost_wakes_promptly(async_redis_client):
+    """A waiter parked on await_lock_lost must wake via the asyncio.Event as
+    soon as the loss is signalled from an async path, not on a poll tick."""
+    config = SemaphoreConfig(name="lock-lost-prompt", limit=1, lock_timeout=30.0)
+    sem = Semaphore(async_redis_client, config)
+    await sem.aacquire()
+
+    waiter = asyncio.create_task(sem.await_lock_lost(timeout=5.0))
+    await asyncio.sleep(0.05)  # let the waiter park on the event
+
+    await async_redis_client.zrem(sem.owners_key, sem.identifier)
+    start = time.monotonic()
+    assert await sem.arefresh() is False  # detects the loss, sets the events
+
+    assert await asyncio.wait_for(waiter, timeout=1.0) is True
+    assert time.monotonic() - start < 0.5

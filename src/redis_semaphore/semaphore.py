@@ -26,25 +26,42 @@ from .base import BaseSemaphoreCommon, _AcquireMode
 from .errors import (
     AcquireError,
     AcquireTimeoutError,
+    AlreadyAcquiredError,
     LockLostError,
     MixedModeError,
     NotAcquiredError,
     PermanentBackendError,
     backend_errors,
+    map_backend_error,
 )
 from .heartbeat import Heartbeat
 from .logger import logger
 from .lua_scripts import LuaScriptRunner, ScriptClientAdapter
 from .metrics import get_metrics
-from .types import AcquireMode, AcquireResult, LockState, SemaphoreConfig, SemaphoreStatus
+from .types import (
+    AcquireMode,
+    AcquireResult,
+    LockState,
+    ReacquirePolicy,
+    SemaphoreConfig,
+    SemaphoreStatus,
+    TimeSource,
+)
 
 # Type alias for lock lost callback
 # Supports both sync and async callbacks
 LockLostCallback = Callable[[str], None] | Callable[[str], Coroutine[Any, Any, None]]
 
-# Global registry for cleanup on shutdown
+# Global registry for cleanup on shutdown. WeakSet is not thread-safe, so all
+# access goes through _registry_lock (semaphores may be created from any thread).
 _active_semaphores: weakref.WeakSet[Semaphore] = weakref.WeakSet()
 _atexit_registered = False
+_registry_lock = threading.Lock()
+
+# Fraction of the client's socket_timeout usable as a single BLPOP wait: the
+# server replies only after the BLPOP timeout elapses, so the wait must stay
+# comfortably below the socket read timeout or the reply arrives too late.
+_BLPOP_SOCKET_TIMEOUT_FRACTION = 0.8
 
 
 def _is_permanent_backend_error(exc: BaseException) -> bool:
@@ -54,7 +71,9 @@ def _is_permanent_backend_error(exc: BaseException) -> bool:
 
 def _cleanup_all_semaphores() -> None:
     """Stop all heartbeats (sync threads and async tasks) on process exit."""
-    for sem in list(_active_semaphores):
+    with _registry_lock:
+        semaphores = list(_active_semaphores)
+    for sem in semaphores:
         try:
             sem._stop_heartbeat()
         except Exception:
@@ -65,6 +84,29 @@ def _cleanup_all_semaphores() -> None:
             logger.debug("Failed to cancel async heartbeat during cleanup", exc_info=True)
 
 
+def _client_socket_timeout(client: object) -> float | None:
+    """Best-effort read of the client's socket_timeout connection kwarg."""
+    kwargs: object = None
+    get_kwargs = getattr(client, "get_connection_kwargs", None)
+    if callable(get_kwargs):
+        try:
+            kwargs = get_kwargs()
+        except Exception:
+            kwargs = None
+    if not isinstance(kwargs, dict):
+        pool = getattr(client, "connection_pool", None)
+        kwargs = getattr(pool, "connection_kwargs", None)
+    if not isinstance(kwargs, dict):
+        return None
+    socket_timeout = kwargs.get("socket_timeout")
+    if socket_timeout is None:
+        return None
+    try:
+        return float(socket_timeout)
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass
 class _AcquireState:
     """Internal state for acquire loop."""
@@ -72,6 +114,7 @@ class _AcquireState:
     start_time: float
     wait_start: float | None = None
     waiting_registered: bool = False
+    attempts: int = 0
 
 
 class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
@@ -95,8 +138,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         config = SemaphoreConfig(
             name="critical-resource",
             limit=1,
-            strict_mode=True,      # Raises LockLostError immediately
-            use_server_time=True,  # Avoids clock skew issues
+            strict_mode=True,  # Raises LockLostError immediately
         )
 
     Warning:
@@ -104,8 +146,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         OR aacquire()/arelease(), but not both. Mixing will raise MixedModeError.
 
     Note:
-        - By default, uses client-side time. Enable use_server_time=True for
-          clock skew protection (adds ~1ms latency per operation).
+        - By default time is read on the Redis server inside the Lua scripts
+          (time_source=TimeSource.SERVER), so clients do not need synchronized
+          clocks. Set time_source=TimeSource.CLIENT for Redis servers older
+          than 3.2 (then NTP synchronization between clients is required).
         - Enable strict_mode=True for mission-critical systems to immediately
           raise LockLostError when lock is lost, preventing zombie processes.
         - Context manager (with/async with) always uses blocking=True and will
@@ -115,6 +159,8 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
     __slots__ = (
         "__weakref__",  # Required for WeakSet support
         "_async_heartbeat",
+        "_async_lock_lost_event",
+        "_blpop_wait_cap",
         "_heartbeat",
         "_lock_lost_event",
         "_metrics",
@@ -143,12 +189,42 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         self._waiting = 0
         self._metrics = get_metrics()
         self._lock_lost_event = threading.Event()
+        self._async_lock_lost_event: asyncio.Event | None = None
+        self._blpop_wait_cap = self._compute_blpop_wait_cap(client)
 
         # Register for cleanup on process exit
-        _active_semaphores.add(self)
-        if not _atexit_registered:
-            atexit.register(_cleanup_all_semaphores)
-            _atexit_registered = True
+        with _registry_lock:
+            _active_semaphores.add(self)
+            if not _atexit_registered:
+                atexit.register(_cleanup_all_semaphores)
+                _atexit_registered = True
+
+    def _compute_blpop_wait_cap(self, client: object) -> float | None:
+        """Cap for a single BLPOP wait, derived from the client socket_timeout.
+
+        A BLPOP whose timeout is >= the socket read timeout makes the reply
+        arrive after the read deadline, so redis-py raises a spurious
+        TimeoutError instead of returning None. Cap each wait below the socket
+        timeout; the acquire loop simply waits again on the next iteration.
+        """
+        socket_timeout = _client_socket_timeout(client)
+        if socket_timeout is None or socket_timeout <= 0:
+            return None
+        cap = socket_timeout * _BLPOP_SOCKET_TIMEOUT_FRACTION
+        if (
+            self._config.acquire_mode == AcquireMode.BLPOP
+            and self._config.blpop_timeout >= socket_timeout
+        ):
+            logger.warning(
+                "Semaphore '%s': blpop_timeout (%.2fs) >= client socket_timeout "
+                "(%.2fs); BLPOP waits are capped at %.2fs to avoid spurious "
+                "socket read timeouts",
+                self._config.name,
+                self._config.blpop_timeout,
+                socket_timeout,
+                cap,
+            )
+        return cap
 
     def _check_mode(self, required: _AcquireMode) -> None:
         """Check that we're not mixing sync/async modes."""
@@ -187,18 +263,6 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 self._config.name,
                 self._identifier,
             )
-
-    def _get_time_ms(self) -> int:
-        """Get current time in milliseconds, using server time if configured."""
-        if self._config.use_server_time:
-            return self._get_server_time_ms()
-        return self._get_current_time_ms()
-
-    async def _get_time_ms_async(self) -> int:
-        """Get current time in milliseconds (async), using server time if configured."""
-        if self._config.use_server_time:
-            return await self._get_server_time_ms_async()
-        return self._get_current_time_ms()
 
     def _can_log_debug(self) -> bool:
         checker = getattr(logger, "isEnabledFor", None)
@@ -391,11 +455,15 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             return None
         return max(0.0, self._config.acquire_timeout - (time.monotonic() - state.start_time))
 
-    def _calculate_retry_interval(self, state: _AcquireState) -> float:
-        """Calculate retry interval with optional exponential backoff and jitter.
+    def _next_retry_interval(self, state: _AcquireState) -> float:
+        """Retry interval with optional exponential backoff and jitter.
+
+        The backoff exponent is the number of completed wait rounds, so
+        intervals grow as base, base*m, base*m^2, ... up to
+        retry_interval_max. Increments ``state.attempts``.
 
         Args:
-            state: Current acquire state with timing information.
+            state: Current acquire state with the attempt counter.
 
         Returns:
             Sleep interval in seconds.
@@ -404,13 +472,11 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
 
         # Apply exponential backoff if max interval is configured
         if self._config.retry_interval_max is not None:
-            elapsed = time.monotonic() - state.start_time
-            # Calculate number of retry cycles elapsed
-            cycles = elapsed / base
-            multiplier = self._config.retry_backoff_multiplier**cycles
+            multiplier = self._config.retry_backoff_multiplier**state.attempts
             interval = min(base * multiplier, self._config.retry_interval_max)
         else:
             interval = base
+        state.attempts += 1
 
         # Apply jitter as a fraction of the current interval
         if self._config.retry_jitter > 0:
@@ -421,7 +487,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
 
     def _wait_polling(self, state: _AcquireState) -> None:
         """Wait using polling strategy, capped at the remaining acquire_timeout."""
-        interval = self._calculate_retry_interval(state)
+        interval = self._next_retry_interval(state)
         remaining = self._remaining_time(state)
         if remaining is not None:
             interval = min(interval, remaining)
@@ -429,26 +495,61 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 return
         time.sleep(interval)
 
-    def _wait_blpop(self, state: _AcquireState) -> None:
-        """Wait using BLPOP, capped at the remaining acquire_timeout.
+    def _blpop_timeout_for(self, state: _AcquireState) -> float:
+        """Effective timeout of one BLPOP wait.
 
-        Capping prevents overshooting acquire_timeout by up to blpop_timeout.
-        Note: BLPOP with timeout 0 blocks forever, so a non-positive remaining
-        means "skip the wait" - the next loop iteration detects the timeout.
+        Capped at the remaining acquire_timeout (prevents overshooting it by
+        up to blpop_timeout) and below the client's socket_timeout (see
+        _compute_blpop_wait_cap). A non-positive result means "skip the wait";
+        BLPOP itself treats 0 as "block forever", so it must never be passed.
         """
-        # BLPOP returns None on timeout, (key, value) on success; we only need
-        # the wakeup signal.
         timeout = self._config.blpop_timeout
+        if self._blpop_wait_cap is not None:
+            timeout = min(timeout, self._blpop_wait_cap)
         remaining = self._remaining_time(state)
         if remaining is not None:
             timeout = min(timeout, remaining)
-            if timeout <= 0:
-                return
-        self._client.blpop([self.queue_key], timeout=timeout)
+        return timeout
+
+    def _on_transient_wait_error(self, exc: BaseException) -> float:
+        """Handle a transient error during a BLPOP wait.
+
+        The wait phase tolerates transient errors (socket read timeout racing
+        the BLPOP reply, a connection blip): they are treated as a spurious
+        wakeup and the acquire loop retries - a real outage still surfaces on
+        the next script call. Returns a short pause to avoid a hot loop when
+        the error was instantaneous (e.g. connection refused).
+        """
+        logger.debug(
+            "Transient error during BLPOP wait on '%s'; retrying acquire loop: %s",
+            self._config.name,
+            exc,
+        )
+        return min(self._config.retry_interval, 1.0)
+
+    def _wait_blpop(self, state: _AcquireState) -> None:
+        """Wait using BLPOP, tolerating transient backend errors."""
+        # BLPOP returns None on timeout, (key, value) on success; we only need
+        # the wakeup signal.
+        timeout = self._blpop_timeout_for(state)
+        if timeout <= 0:
+            return
+        try:
+            self._client.blpop([self.queue_key], timeout=timeout)
+        except (redis.exceptions.RedisError, OSError) as exc:
+            mapped = map_backend_error(exc, operation="wait", name=self._config.name)
+            if not mapped.is_transient:
+                raise mapped from exc
+            pause = self._on_transient_wait_error(mapped)
+            remaining = self._remaining_time(state)
+            if remaining is not None:
+                pause = min(pause, remaining)
+            if pause > 0:
+                time.sleep(pause)
 
     async def _wait_polling_async(self, state: _AcquireState) -> None:
         """Async wait using polling strategy, capped at the remaining acquire_timeout."""
-        interval = self._calculate_retry_interval(state)
+        interval = self._next_retry_interval(state)
         remaining = self._remaining_time(state)
         if remaining is not None:
             interval = min(interval, remaining)
@@ -457,14 +558,22 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         await asyncio.sleep(interval)
 
     async def _wait_blpop_async(self, state: _AcquireState) -> None:
-        """Async wait using BLPOP, capped at the remaining acquire_timeout."""
-        timeout = self._config.blpop_timeout
-        remaining = self._remaining_time(state)
-        if remaining is not None:
-            timeout = min(timeout, remaining)
-            if timeout <= 0:
-                return
-        await self._client.blpop([self.queue_key], timeout=timeout)  # type: ignore[misc]
+        """Async wait using BLPOP, tolerating transient backend errors."""
+        timeout = self._blpop_timeout_for(state)
+        if timeout <= 0:
+            return
+        try:
+            await self._client.blpop([self.queue_key], timeout=timeout)  # type: ignore[misc]
+        except (redis.exceptions.RedisError, OSError) as exc:
+            mapped = map_backend_error(exc, operation="wait", name=self._config.name)
+            if not mapped.is_transient:
+                raise mapped from exc
+            pause = self._on_transient_wait_error(mapped)
+            remaining = self._remaining_time(state)
+            if remaining is not None:
+                pause = min(pause, remaining)
+            if pause > 0:
+                await asyncio.sleep(pause)
 
     def _wait_for_slot(self, state: _AcquireState) -> None:
         """Wait for a slot using the configured strategy."""
@@ -480,6 +589,15 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         else:
             await self._wait_polling_async(state)
 
+    def _queue_ttl_ms(self) -> int:
+        """TTL for the notification queue key.
+
+        Tokens are only meaningful moments after a release (waiters poll at
+        blpop_timeout anyway), so anything that outlives one lock_timeout is
+        garbage; the TTL keeps abandoned semaphore names from leaking keys.
+        """
+        return int(self._config.lock_timeout * 1000)
+
     def _notify_waiters(self) -> None:
         """Notify one waiter that a slot is available via LPUSH.
 
@@ -492,6 +610,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             pipe = self._client.pipeline(transaction=False)
             pipe.lpush(self.queue_key, "1")
             pipe.ltrim(self.queue_key, 0, self._config.limit - 1)
+            pipe.pexpire(self.queue_key, self._queue_ttl_ms())
             pipe.execute()
         except Exception:
             # Non-critical: if notify fails, waiters will retry on timeout
@@ -506,6 +625,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             pipe = self._client.pipeline(transaction=False)
             pipe.lpush(self.queue_key, "1")
             pipe.ltrim(self.queue_key, 0, self._config.limit - 1)
+            pipe.pexpire(self.queue_key, self._queue_ttl_ms())
             await pipe.execute()  # type: ignore[misc]
         except Exception:
             logger.debug("Failed to notify waiters", exc_info=True)
@@ -533,9 +653,21 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         with backend_errors("acquire", self._config.name):
             return self._acquire(blocking)
 
+    def _check_reacquire(self) -> None:
+        """Enforce reacquire_policy=FORBID on an already-acquired instance."""
+        if (
+            self._state == LockState.ACQUIRED
+            and self._config.reacquire_policy is ReacquirePolicy.FORBID
+        ):
+            raise AlreadyAcquiredError(
+                f"Semaphore '{self._config.name}' is already acquired by this "
+                "instance (reacquire_policy=FORBID)"
+            )
+
     def _acquire(self, blocking: bool = True) -> AcquireResult:
         self._check_mode(_AcquireMode.SYNC)
         self._check_lock_lost()
+        self._check_reacquire()
 
         if self._identifier is None:
             self._identifier = self._generate_identifier()
@@ -544,8 +676,6 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         lock_timeout_ms = int(self._config.lock_timeout * 1000)
 
         while True:
-            now_ms = self._get_time_ms()
-
             success, fencing_token, expires_at, current_count = self._runner.acquire(
                 self._script_client,
                 self.owners_key,
@@ -553,7 +683,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 self._identifier,
                 self._config.limit,
                 lock_timeout_ms,
-                now_ms,
+                self._now_ms_arg(),
             )
 
             if self._metrics.enabled or self._can_log_debug():
@@ -599,6 +729,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
     async def _aacquire(self, blocking: bool = True) -> AcquireResult:
         self._check_mode(_AcquireMode.ASYNC)
         self._check_lock_lost()
+        self._check_reacquire()
 
         if self._identifier is None:
             self._identifier = self._generate_identifier()
@@ -607,8 +738,6 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         lock_timeout_ms = int(self._config.lock_timeout * 1000)
 
         while True:
-            now_ms = await self._get_time_ms_async()
-
             success, fencing_token, expires_at, current_count = await self._runner.acquire_async(
                 self._script_client,
                 self.owners_key,
@@ -616,7 +745,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 self._identifier,
                 self._config.limit,
                 lock_timeout_ms,
-                now_ms,
+                self._now_ms_arg(),
             )
 
             if self._metrics.enabled or self._can_log_debug():
@@ -647,7 +776,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         """Release the semaphore slot.
 
         Returns:
-            True if successfully released, False if not owned.
+            True if successfully released, False if the slot was not held on
+            the server (e.g. it had already expired). Local state is reset
+            either way - after release() the instance reports is_acquired
+            False and can acquire again.
 
         Raises:
             NotAcquiredError: If attempting to release an unacquired semaphore.
@@ -675,9 +807,14 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             self._identifier,
         )
 
+        # Reset local state even when the server says "not owned" (the slot
+        # already expired), so is_acquired never keeps reporting True for a
+        # slot we don't hold. On a raised backend error state is kept so the
+        # caller can retry release().
+        self._reset_state()
+
         if released:
             self._notify_waiters()
-            self._reset_state()
 
         return released
 
@@ -710,9 +847,12 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             self._identifier,
         )
 
+        # See _release: reset regardless of the server answer, but not on a
+        # raised backend error (the caller may retry).
+        self._reset_state()
+
         if released:
             await self._notify_waiters_async()
-            self._reset_state()
 
         return released
 
@@ -728,11 +868,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 command such as ACL/unknown command (permanent).
         """
         with backend_errors("status", self._config.name):
-            now_ms = self._get_time_ms()
             count, is_owner, expires_ms = self._runner.status(
                 self._script_client,
                 self.owners_key,
-                now_ms,
+                self._now_ms_arg(),
                 self._identifier,
             )
             return self._build_status(count, is_owner, expires_ms)
@@ -740,11 +879,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
     async def astatus(self) -> SemaphoreStatus:
         """Async version of :meth:`status`."""
         with backend_errors("status", self._config.name):
-            now_ms = await self._get_time_ms_async()
             count, is_owner, expires_ms = await self._runner.status_async(
                 self._script_client,
                 self.owners_key,
-                now_ms,
+                self._now_ms_arg(),
                 self._identifier,
             )
             return self._build_status(count, is_owner, expires_ms)
@@ -771,14 +909,14 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
                 command such as ACL/unknown command (permanent).
         """
         with backend_errors("cleanup", self._config.name):
-            now_ms = self._get_time_ms()
-            return self._runner.cleanup(self._script_client, self.owners_key, now_ms)
+            return self._runner.cleanup(self._script_client, self.owners_key, self._now_ms_arg())
 
     async def acleanup(self) -> int:
         """Async version of :meth:`cleanup`."""
         with backend_errors("cleanup", self._config.name):
-            now_ms = await self._get_time_ms_async()
-            return await self._runner.cleanup_async(self._script_client, self.owners_key, now_ms)
+            return await self._runner.cleanup_async(
+                self._script_client, self.owners_key, self._now_ms_arg()
+            )
 
     def _reset_state(self) -> None:
         """Reset internal state after release."""
@@ -788,6 +926,14 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         self._expires_at = None
         self._acquire_mode = _AcquireMode.NONE
         self._lock_lost_event.clear()
+        if self._async_lock_lost_event is not None:
+            self._async_lock_lost_event.clear()
+
+    def _signal_lock_lost_from_async(self) -> None:
+        """Set both loss events; only safe from the event loop thread."""
+        self._lock_lost_event.set()
+        if self._async_lock_lost_event is not None:
+            self._async_lock_lost_event.set()
 
     def wait_for_lock_lost(self, timeout: float | None = None) -> bool:
         """Wait for the lock to be lost.
@@ -812,24 +958,38 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
     async def await_lock_lost(self, timeout: float | None = None) -> bool:
         """Async version of wait_for_lock_lost.
 
+        Wakes immediately when the loss is signalled from the async paths
+        (async heartbeat, arefresh). A coarse 1s re-check of the sync event
+        also catches a loss signalled from a heartbeat *thread*, in case sync
+        and async usage is mixed across the instance's lifetime.
+
         Args:
             timeout: Maximum time to wait in seconds. None means wait forever.
 
         Returns:
             True if lock was lost, False if timeout occurred.
         """
-        poll_interval = 0.05  # 50ms polling
-        elapsed = 0.0
-
-        while True:
+        if self._lock_lost_event.is_set():
+            return True
+        if self._async_lock_lost_event is None:
+            self._async_lock_lost_event = asyncio.Event()
             if self._lock_lost_event.is_set():
+                self._async_lock_lost_event.set()
+        event = self._async_lock_lost_event
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            step = 1.0
+            if deadline is not None:
+                step = min(step, deadline - time.monotonic())
+                if step <= 0:
+                    return False
+            try:
+                await asyncio.wait_for(event.wait(), timeout=step)
                 return True
-
-            if timeout is not None and elapsed >= timeout:
-                return False
-
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+            except asyncio.TimeoutError:
+                if self._lock_lost_event.is_set():
+                    return True
 
     def refresh(self) -> bool:
         """Refresh the lock TTL.
@@ -850,25 +1010,24 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             return False
 
         lock_timeout_ms = int(self._config.lock_timeout * 1000)
-        now_ms = self._get_time_ms()
 
-        success = self._runner.refresh(
+        new_expires_ms = self._runner.refresh(
             self._script_client,
             self.owners_key,
             self._identifier,
             lock_timeout_ms,
-            now_ms,
+            self._now_ms_arg(),
         )
 
-        if success:
-            self._expires_at = (now_ms + lock_timeout_ms) / 1000
-        else:
-            self._state = LockState.LOST
-            self._lock_lost_event.set()
-            self._stop_heartbeat()
-            self._check_lock_lost()
+        if new_expires_ms:
+            self._expires_at = new_expires_ms / 1000
+            return True
 
-        return success
+        self._state = LockState.LOST
+        self._lock_lost_event.set()
+        self._stop_heartbeat()
+        self._check_lock_lost()
+        return False
 
     async def arefresh(self) -> bool:
         """Asynchronously refresh the lock TTL.
@@ -886,25 +1045,24 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             return False
 
         lock_timeout_ms = int(self._config.lock_timeout * 1000)
-        now_ms = await self._get_time_ms_async()
 
-        success = await self._runner.refresh_async(
+        new_expires_ms = await self._runner.refresh_async(
             self._script_client,
             self.owners_key,
             self._identifier,
             lock_timeout_ms,
-            now_ms,
+            self._now_ms_arg(),
         )
 
-        if success:
-            self._expires_at = (now_ms + lock_timeout_ms) / 1000
-        else:
-            self._state = LockState.LOST
-            self._lock_lost_event.set()
-            await self._stop_heartbeat_async()
-            self._check_lock_lost()
+        if new_expires_ms:
+            self._expires_at = new_expires_ms / 1000
+            return True
 
-        return success
+        self._state = LockState.LOST
+        self._signal_lock_lost_from_async()
+        await self._stop_heartbeat_async()
+        self._check_lock_lost()
+        return False
 
     def _heartbeat_refresh(self) -> bool:
         """Refresh invoked by the heartbeat thread.
@@ -921,17 +1079,17 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             if self._identifier is None or self._state != LockState.ACQUIRED:
                 return False
             lock_timeout_ms = int(self._config.lock_timeout * 1000)
-            now_ms = self._get_time_ms()
-            success = self._runner.refresh(
+            new_expires_ms = self._runner.refresh(
                 self._script_client,
                 self.owners_key,
                 self._identifier,
                 lock_timeout_ms,
-                now_ms,
+                self._now_ms_arg(),
             )
-            if success:
-                self._expires_at = (now_ms + lock_timeout_ms) / 1000
-            return success
+            if new_expires_ms:
+                self._expires_at = new_expires_ms / 1000
+                return True
+            return False
 
     async def _heartbeat_refresh_async(self) -> bool:
         """Async counterpart of :meth:`_heartbeat_refresh`."""
@@ -939,17 +1097,17 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             if self._identifier is None or self._state != LockState.ACQUIRED:
                 return False
             lock_timeout_ms = int(self._config.lock_timeout * 1000)
-            now_ms = await self._get_time_ms_async()
-            success = await self._runner.refresh_async(
+            new_expires_ms = await self._runner.refresh_async(
                 self._script_client,
                 self.owners_key,
                 self._identifier,
                 lock_timeout_ms,
-                now_ms,
+                self._now_ms_arg(),
             )
-            if success:
-                self._expires_at = (now_ms + lock_timeout_ms) / 1000
-            return success
+            if new_expires_ms:
+                self._expires_at = new_expires_ms / 1000
+                return True
+            return False
 
     def _start_heartbeat(self) -> None:
         """Start the heartbeat thread."""
@@ -1007,7 +1165,7 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
             if self._state != LockState.ACQUIRED:
                 return
             self._state = LockState.LOST
-            self._lock_lost_event.set()
+            self._signal_lock_lost_from_async()
             if self._on_lock_lost:
                 result = self._on_lock_lost(identifier)
                 if asyncio.iscoroutine(result):
@@ -1074,8 +1232,7 @@ class Mutex(Semaphore):
         with Mutex(
             client,
             "critical-lock",
-            strict_mode=True,      # Raises LockLostError immediately
-            use_server_time=True,  # Avoids clock skew issues
+            strict_mode=True,  # Raises LockLostError immediately
         ) as lock:
             # critical work
             pass
@@ -1096,9 +1253,12 @@ class Mutex(Semaphore):
         acquire_mode: AcquireMode = AcquireMode.BLPOP,
         retry_interval_max: float | None = None,
         retry_backoff_multiplier: float = 2.0,
-        retry_jitter: float = 0.0,
+        retry_jitter: float = 0.1,
         blpop_timeout: float = 5.0,
         refresh_retry_interval: float | None = None,
+        time_source: TimeSource = TimeSource.SERVER,
+        cluster_hash_tags: bool = False,
+        reacquire_policy: ReacquirePolicy = ReacquirePolicy.RENEW,
         on_lock_lost: LockLostCallback | None = None,
     ) -> None:
         config = SemaphoreConfig(
@@ -1117,5 +1277,8 @@ class Mutex(Semaphore):
             retry_jitter=retry_jitter,
             blpop_timeout=blpop_timeout,
             refresh_retry_interval=refresh_retry_interval,
+            time_source=time_source,
+            cluster_hash_tags=cluster_hash_tags,
+            reacquire_policy=reacquire_policy,
         )
         super().__init__(client, config, on_lock_lost=on_lock_lost)
