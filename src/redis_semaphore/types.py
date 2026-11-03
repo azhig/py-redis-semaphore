@@ -1,6 +1,7 @@
 """Types and configuration for redis-semaphore."""
 
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -210,3 +211,278 @@ class SemaphoreConfig:
                 DeprecationWarning,
                 stacklevel=3,
             )
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimit:
+    """One sliding-window limit of a rate limiter.
+
+    Attributes:
+        name: Limit name, used as the cost key and in Redis key names
+            (e.g. "requests", "tokens"). Must not contain ':' - unlike the
+            limiter name, which may be any string.
+        limit: Maximum number of units consumed within any ``window``.
+        window: Sliding window length in seconds (60.0 for "per minute").
+    """
+
+    name: str
+    limit: int
+    window: float = 60.0
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("RateLimit name must not be empty")
+        if ":" in self.name:
+            # Keys are "<namespace>:<limiter name>:<limit name>:log". Limiter
+            # names may contain ':' freely, so the limit name must not -
+            # otherwise "a" + "b:x" and "a:b" + "x" would share Redis keys.
+            raise ValueError(f"RateLimit name must not contain ':' (got {self.name!r})")
+        if self.limit < 1:
+            raise ValueError("RateLimit limit must be >= 1")
+        if self.window < 0.001:
+            raise ValueError("RateLimit window must be >= 0.001 (1 ms)")
+
+
+@dataclass(slots=True)
+class RateLimiterConfig:
+    """Configuration for a rate limiter.
+
+    Attributes:
+        name: Unique name of the rate-limited resource (e.g. a certificate id).
+        limits: Limits checked atomically on every acquire; a request is
+            admitted only if it fits all of them.
+        acquire_timeout: Maximum time a blocking acquire may wait (None =
+            infinite). Fails fast: if the earliest admission time computed by
+            Redis lies beyond the remaining timeout, the acquire raises right
+            away instead of sleeping until the deadline.
+        wait_jitter: Maximum random extra delay in seconds added to each wait
+            (default 0.05), so waiters woken by the same expiry do not retry
+            in lockstep.
+        namespace: Redis key prefix.
+        time_source: Clock used for window math (default: TimeSource.SERVER;
+            see TimeSource).
+        cluster_hash_tags: If True, keys are formatted as
+            ``{namespace:name}:...`` so all keys of one limiter map to the
+            same Redis Cluster slot. Changes key names.
+    """
+
+    name: str
+    limits: Sequence[RateLimit]
+    acquire_timeout: float | None = None
+    wait_jitter: float = 0.05
+    namespace: str = "ratelimit"
+    time_source: TimeSource = TimeSource.SERVER
+    cluster_hash_tags: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("name must not be empty")
+        self.limits = tuple(self.limits)
+        if not self.limits:
+            raise ValueError("limits must not be empty")
+        names = [limit.name for limit in self.limits]
+        if len(set(names)) != len(names):
+            raise ValueError("limit names must be unique")
+        if self.acquire_timeout is not None and self.acquire_timeout <= 0:
+            raise ValueError("acquire_timeout must be > 0 or None")
+        if self.wait_jitter < 0:
+            raise ValueError("wait_jitter must be >= 0")
+
+
+@dataclass(slots=True)
+class RatePermit:
+    """Result of a rate limiter acquire.
+
+    On success the consumed units are recorded in Redis under ``identifier``;
+    pass the permit to ``adjust()`` once the real cost is known (e.g. tokens
+    actually used by an LLM response). ``adjust()`` updates ``costs`` in place.
+
+    Attributes:
+        success: Whether the request was admitted.
+        identifier: Unique id of the recorded consumption (None on failure).
+        costs: Units charged per limit name.
+        acquired_at: Epoch seconds of admission, or None on failure. With
+            ``TimeSource.SERVER`` this is the Redis server's clock.
+        retry_after: On failure, seconds until the request would fit
+            (computed atomically by Redis); None on success.
+        used: Units consumed per limit within its window, as observed by the
+            call (including this request on success).
+        limiter: Identity (``namespace:name``) of the limiter that issued the
+            permit; ``adjust()`` refuses permits of other limiters.
+    """
+
+    success: bool
+    identifier: str | None
+    costs: dict[str, int]
+    acquired_at: float | None
+    retry_after: float | None
+    used: dict[str, int] = field(default_factory=dict)
+    limiter: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimitUsage:
+    """Point-in-time consumption of one limit."""
+
+    name: str
+    limit: int
+    window: float
+    used: int
+
+    @property
+    def available(self) -> int:
+        """Units that still fit into the current window."""
+        return max(0, self.limit - self.used)
+
+
+@dataclass(slots=True)
+class DispatchConfig:
+    """Configuration of a shared dispatch queue (DispatchQueue/DispatchWorker).
+
+    Producers and workers of the same queues must use the same namespace,
+    group and cluster_hash_tags.
+
+    Attributes:
+        namespace: Redis key prefix.
+        group: Consumer group name of the queue streams.
+        max_queue_size: Max jobs per queue (waiting + in progress); submit
+            raises QueueFullError beyond it. None = unbounded.
+        leader_ttl: TTL of a queue's leadership Mutex. A dead worker's
+            queues get a new leader after at most this long.
+        election_interval: Mean pause between a worker's attempts to take
+            one more free queue (None = leader_ttl / 3). Every attempt on a
+            busy queue is a failed non-blocking Mutex acquire - it shows up
+            in the semaphore metrics as result="busy" - and probing much
+            faster than leader_ttl buys nothing, so keep this coarse. After
+            a successful take the pause is skipped, so covering many free
+            queues at startup does not depend on this interval.
+        max_admitted: Max admitted jobs of one queue running concurrently on
+            its leader (None = unlimited). At the cap the leader waits for a
+            handler to finish before starting the next job (FIFO is kept).
+        reclaim_idle: A job taken by a worker that has not been touched for
+            this long is presumed abandoned (its worker died) and is re-run
+            by the queue's current leader. Live workers touch their jobs every
+            reclaim_idle / 3.
+        reclaim_interval: How often a leader looks for abandoned jobs.
+        reply_ttl: Seconds a result waits for its submitter.
+        read_timeout: Max block of one stream read; also how quickly an idle
+            leader notices stop(). Capped below the client socket_timeout.
+        max_queues_per_worker: Max queues one worker leads (None = no cap).
+            With a cap, make sure workers x cap >= queues, or some queues
+            stay without a leader.
+        cluster_hash_tags: If True, keys of one queue share a Redis Cluster
+            hash tag (``{namespace:queue}:...``). Changes key names. The
+            queue's leadership Mutex gets its own tag
+            (``{namespace:queue:leader}:...``), so it may land in a different
+            slot than the stream - fine, since no script mixes the two.
+    """
+
+    namespace: str = "dispatch"
+    group: str = "dispatchers"
+    max_queue_size: int | None = None
+    leader_ttl: float = 10.0
+    election_interval: float | None = None
+    reclaim_idle: float = 30.0
+    reclaim_interval: float = 5.0
+    reply_ttl: float = 60.0
+    read_timeout: float = 1.0
+    max_queues_per_worker: int | None = None
+    max_admitted: int | None = None
+    cluster_hash_tags: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.namespace:
+            raise ValueError("namespace must not be empty")
+        if not self.group:
+            raise ValueError("group must not be empty")
+        if self.max_queue_size is not None and self.max_queue_size < 1:
+            raise ValueError("max_queue_size must be >= 1 or None")
+        if self.max_queues_per_worker is not None and self.max_queues_per_worker < 1:
+            raise ValueError("max_queues_per_worker must be >= 1 or None")
+        if self.max_admitted is not None and self.max_admitted < 1:
+            raise ValueError("max_admitted must be >= 1 or None")
+        if self.election_interval is not None and self.election_interval <= 0:
+            raise ValueError("election_interval must be > 0 or None")
+        for name in (
+            "leader_ttl",
+            "reclaim_idle",
+            "reclaim_interval",
+            "reply_ttl",
+            "read_timeout",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be > 0")
+
+
+@dataclass(frozen=True, slots=True)
+class QueueStatus:
+    """Point-in-time view of a dispatch queue (the same from every process).
+
+    Attributes:
+        name: Queue name.
+        length: Jobs in the queue: waiting + in progress.
+        in_progress: Jobs delivered to a worker and not acknowledged yet: the
+            one awaiting admission, admitted ones still running, and jobs
+            waiting to be re-run after their worker died.
+        waiting: Jobs nobody has taken yet.
+        oldest_age: Seconds since the oldest job in the queue was submitted
+            (Redis server clock), or None if the queue is empty. Growing
+            steadily means the queue is stuck or starved.
+        has_leader: Whether some worker currently holds the queue's
+            leadership. False with a non-empty queue means nobody serves it.
+    """
+
+    name: str
+    length: int
+    in_progress: int
+    waiting: int
+    oldest_age: float | None
+    has_leader: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerHealth:
+    """Local health of one DispatchWorker (no Redis round-trip).
+
+    Attributes:
+        worker_id: The worker id (also its consumer name in the streams).
+        running: run() is active.
+        stopping: stop() was requested and shutdown is in progress.
+        leading: Queues this worker currently leads.
+        jobs_in_progress: Handlers running in this worker (waiting for
+            admission or admitted).
+        last_loop_age: Seconds since the worker's main loop last ran, or None
+            if it is not running. Stays below ~1.5 x election_interval while
+            the worker is alive.
+        last_error: The last Redis error seen by elections/leaders, or None.
+            Cleared by the next successful election round.
+        last_error_age: Seconds since last_error, or None.
+        healthy: running, not stopping, the main loop is not stalled and no
+            Redis error in the last stall limit (5 x election_interval).
+            Suits a readiness probe; for a liveness probe check only
+            ``running`` and ``last_loop_age`` - restarting pods does not fix a
+            Redis outage.
+    """
+
+    worker_id: str
+    running: bool
+    stopping: bool
+    leading: tuple[str, ...]
+    jobs_in_progress: int
+    last_loop_age: float | None
+    last_error: str | None
+    last_error_age: float | None
+    healthy: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RateLimiterStatus:
+    """Point-in-time view of a rate limiter, observed without consuming.
+
+    Attributes:
+        name: Rate limiter name.
+        usage: Consumption per limit name.
+    """
+
+    name: str
+    usage: dict[str, RateLimitUsage]

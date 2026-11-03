@@ -20,6 +20,19 @@ class AcquireTimeoutError(AcquireError):
     """Timeout while trying to acquire lock."""
 
 
+class RateLimitTimeoutError(AcquireTimeoutError):
+    """A rate-limited request could not be admitted within acquire_timeout.
+
+    Attributes:
+        retry_after: Seconds until the request would fit, as computed by Redis
+            on the last attempt.
+    """
+
+    def __init__(self, message: str, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(message)
+
+
 class AlreadyAcquiredError(AcquireError):
     """acquire() called on an instance that already holds a slot.
 
@@ -45,6 +58,69 @@ class LockLostError(RedisSemaphoreError):
 
 class MixedModeError(RedisSemaphoreError):
     """Raised when mixing sync and async operations on the same semaphore."""
+
+
+class DispatchError(RedisSemaphoreError):
+    """Base class for shared dispatch queue errors."""
+
+
+class QueueFullError(DispatchError):
+    """The queue already holds max_queue_size jobs."""
+
+
+class JobTimeoutError(DispatchError):
+    """No result arrived within the submit timeout.
+
+    The job may still be executed later if it was admitted before the
+    deadline; jobs still waiting in the queue past it are dropped.
+    """
+
+
+class JobFailedError(DispatchError):
+    """The job handler raised an exception.
+
+    Attributes:
+        error_type: Class name of the exception raised by the handler.
+        data: Structured details from a :class:`JobError` (empty otherwise).
+    """
+
+    def __init__(self, error_type: str, message: str, data: dict | None = None):
+        self.error_type = error_type
+        self.data = data or {}
+        super().__init__(f"{error_type}: {message}")
+
+
+class JobError(Exception):
+    """Raise from a job handler to fail the job with JSON-serializable details.
+
+    The submitter receives a :class:`JobFailedError` whose ``data`` is
+    ``data`` (other exceptions only transfer their class name and message).
+    """
+
+    def __init__(self, message: str, data: dict | None = None):
+        self.data = data or {}
+        super().__init__(message)
+
+
+class RequeueJob(Exception):
+    """Raise from a job handler to put the job back into its queue.
+
+    The submitter gets no reply yet and keeps waiting. The queue's leader runs
+    the job again before any job that has not been started yet - e.g. after an
+    upstream 429, wait for the quota again *before* ``job.admit()`` so the
+    job holds the head of the queue while it waits.
+
+    Args:
+        delay: Seconds to wait before the job may run again. Raised before
+            ``admit()``, the queue waits too (the job keeps its place);
+            raised after it, other jobs go on meanwhile.
+    """
+
+    def __init__(self, delay: float = 0.0):
+        if delay < 0:
+            raise ValueError("delay must be >= 0")
+        self.delay = delay
+        super().__init__(f"requeue after {delay}s")
 
 
 class BackendError(RedisSemaphoreError):
@@ -89,7 +165,9 @@ class PermanentBackendError(BackendError):
 
 
 class RedisConnectionError(TransientBackendError):
-    """Redis is unreachable: connection refused/reset, timeout, loading, readonly."""
+    """Redis is unreachable or the wait was interrupted server-side: connection
+    refused/reset, timeout, loading, readonly, or a blocking command unblocked
+    by CLIENT UNBLOCK (typical during a Sentinel failover)."""
 
 
 class CommandDeniedError(PermanentBackendError):
@@ -118,6 +196,13 @@ def map_backend_error(
 
     # Transient: replica/failover write rejection (also a ResponseError).
     if isinstance(exc, _rexc.ReadOnlyError):
+        return RedisConnectionError(message, operation=operation, name=name, original=exc)
+
+    # Transient: a blocked command (BLPOP/BLMOVE/XREADGROUP ...) interrupted
+    # server-side via CLIENT UNBLOCK - Redis does this to blocked clients
+    # during failovers. Retrying the wait is the right response, so this
+    # ResponseError must not fall through to the permanent branch below.
+    if isinstance(exc, _rexc.ResponseError) and message.startswith("UNBLOCKED"):
         return RedisConnectionError(message, operation=operation, name=name, original=exc)
 
     # Transient: connectivity. BusyLoadingError subclasses ConnectionError.
