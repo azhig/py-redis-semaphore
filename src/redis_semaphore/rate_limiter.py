@@ -155,8 +155,7 @@ class RateLimiter:
             # Limit names alone ("requests", "tokens") recur across limiters,
             # so they cannot prove the permit is ours - the identity can.
             raise ValueError(
-                f"Permit belongs to rate limiter '{permit.limiter}', "
-                f"not '{self._scope}'"
+                f"Permit belongs to rate limiter '{permit.limiter}', not '{self._scope}'"
             )
         if set(permit.costs) != {limit.name for limit in self._config.limits}:
             raise ValueError(
