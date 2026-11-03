@@ -204,9 +204,10 @@ How it works:
   idempotency key if a repeat is harmful.
 - Graceful shutdown (`worker.stop()`, e.g. on SIGTERM): jobs not admitted yet
   are handed back to the queue at once, admitted ones run to completion.
-- Deadlines are wall-clock, so pod clocks must be NTP-synchronized. Each
-  waiting `asubmit()` holds one Redis connection (BLPOP) - size the pool for
-  the expected number of concurrent submissions.
+- Deadlines use the Redis server clock (stamped inside the enqueue script),
+  like everything else in this library - no NTP sync between pods needed.
+  Each waiting `asubmit()` holds one Redis connection (BLMOVE) - size the
+  pool for the expected number of concurrent submissions.
 
 #### Health checks
 

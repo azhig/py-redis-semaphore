@@ -474,14 +474,20 @@ return used
 # KEYS[2] = submit dedup marker key (same hash slot as the stream)
 # ARGV[1] = max queue size (0 = unbounded)
 # ARGV[2] = dedup marker TTL in ms
-# ARGV[3..] = field/value pairs of the stream entry
+# ARGV[3] = job timeout in ms, or '' for no deadline
+# ARGV[4] = job id
+# ARGV[5] = JSON payload
 #
-# Returns: the new entry id, or nil if the queue is full. XADD with an auto id
-#   is not idempotent, so the entry id is remembered under the marker key: a
-#   resent call (the client retried after losing the reply) returns the id of
-#   the entry it already created instead of appending a duplicate job.
+# Returns: the new entry id, or nil if the queue is full.
+#   - created/deadline are stamped from the SERVER clock, like everywhere else
+#     in this library, so producers and workers need no NTP sync.
+#   - XADD with an auto id is not idempotent, so the entry id is remembered
+#     under the marker key: a resent call (the client retried after losing the
+#     reply) returns the id of the entry it already created instead of
+#     appending a duplicate job.
 DISPATCH_ENQUEUE_SCRIPT = """
--- XADD with an auto id is non-deterministic: Redis 5-6 need effect replication.
+-- XADD with an auto id and TIME are non-deterministic: Redis 5-6 need effect
+-- replication (a no-op on Redis 7+).
 if redis.replicate_commands then redis.replicate_commands() end
 local existing = redis.call('GET', KEYS[2])
 if existing then return existing end
@@ -489,7 +495,13 @@ local max_size = tonumber(ARGV[1])
 if max_size > 0 and redis.call('XLEN', KEYS[1]) >= max_size then
     return false
 end
-local entry_id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 3))
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local deadline = ''
+local timeout_ms = tonumber(ARGV[3])
+if timeout_ms then deadline = tostring(now_ms + timeout_ms) end
+local entry_id = redis.call('XADD', KEYS[1], '*',
+    'id', ARGV[4], 'payload', ARGV[5], 'created', tostring(now_ms), 'deadline', deadline)
 redis.call('SET', KEYS[2], entry_id, 'PX', math.floor(tonumber(ARGV[2])))
 return entry_id
 """
@@ -841,12 +853,16 @@ class LuaScriptRunner:
         marker_key: str,
         max_size: int,
         marker_ttl_ms: int,
-        fields: Sequence[str],
+        job_id: str,
+        payload: str,
+        timeout_ms: int | str,
     ) -> str | None:
         """Append a job; returns the entry id, or None if the queue is full.
 
-        The marker key makes a retried call return the id it already created
-        instead of appending a duplicate.
+        created/deadline are stamped from the server clock inside the script
+        (``timeout_ms`` is a duration; '' = no deadline). The marker key makes
+        a retried call return the id it already created instead of appending
+        a duplicate.
         """
         result: object = client.evalsha(
             self._registry.get_sha("dispatch_enqueue"),
@@ -855,7 +871,9 @@ class LuaScriptRunner:
             marker_key,
             max_size,
             marker_ttl_ms,
-            *fields,
+            timeout_ms,
+            job_id,
+            payload,
         )
         return _to_optional_str(result)
 
@@ -866,7 +884,9 @@ class LuaScriptRunner:
         marker_key: str,
         max_size: int,
         marker_ttl_ms: int,
-        fields: Sequence[str],
+        job_id: str,
+        payload: str,
+        timeout_ms: int | str,
     ) -> str | None:
         """Async variant of :meth:`dispatch_enqueue`."""
         result: object = await client.aevalsha(
@@ -876,7 +896,9 @@ class LuaScriptRunner:
             marker_key,
             max_size,
             marker_ttl_ms,
-            *fields,
+            timeout_ms,
+            job_id,
+            payload,
         )
         return _to_optional_str(result)
 

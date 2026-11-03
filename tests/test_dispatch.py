@@ -317,9 +317,16 @@ async def test_reclaims_job_of_dead_worker(async_redis_client):
     queue = DispatchQueue(async_redis_client, config)
     stream = queue.stream_key("orphan")
     await async_redis_client.xgroup_create(stream, config.group, id="0", mkstream=True)
-    fields = queue._fields("job-1", "payload", timeout=10)
+    sec, usec = await async_redis_client.time()
+    now_ms = sec * 1000 + usec // 1000
+    fields = {
+        "id": "job-1",
+        "payload": json.dumps("payload"),
+        "created": str(now_ms),
+        "deadline": str(now_ms + 10_000),
+    }
     pipe = async_redis_client.pipeline(transaction=True)
-    pipe.xadd(stream, dict(zip(fields[::2], fields[1::2], strict=True)))
+    pipe.xadd(stream, fields)
     pipe.xreadgroup(config.group, "ghost", {stream: ">"}, count=1)  # taken, never answered
     await pipe.execute()
 
@@ -547,18 +554,51 @@ async def test_retried_enqueue_does_not_duplicate_job(async_redis_client):
     queue = DispatchQueue(async_redis_client, config)
     runner = LuaScriptRunner(LuaScriptRegistry())
     adapter = ScriptClientAdapter(async_redis_client)
-    fields = queue._fields("job-1", {"x": 1}, timeout=None)
     args = (
         queue.stream_key("dup"),
         queue._keys.submit_marker("dup", "job-1"),
         0,
         60_000,
-        fields,
+        "job-1",
+        json.dumps({"x": 1}),
+        "",
     )
     first = await runner.dispatch_enqueue_async(adapter, *args)
     second = await runner.dispatch_enqueue_async(adapter, *args)  # the resent call
     assert first == second
     assert await queue.alength("dup") == 1
+
+
+async def test_enqueue_stamps_server_time(async_redis_client):
+    """created/deadline come from the Redis server clock, not the producer's
+    wall clock, so skewed pod clocks cannot poison deadlines."""
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    with pytest.raises(JobTimeoutError):
+        await queue.asubmit("stamp", None, timeout=0.3)
+    ((_, fields),) = await async_redis_client.xrange(queue.stream_key("stamp"))
+    sec, usec = await async_redis_client.time()
+    now_ms = sec * 1000 + usec // 1000
+    created_ms = float(fields[b"created"])
+    deadline_ms = float(fields[b"deadline"])
+    assert abs(created_ms - now_ms) < 2_000
+    assert abs(deadline_ms - created_ms - 300) < 50
+
+
+def test_job_remaining_uses_measured_clock_offset():
+    """remaining compares server-clock deadlines against server-clock 'now'."""
+    server_ahead = 3600.0  # the server clock is an hour ahead of this machine
+    job = Job(
+        queue="q",
+        entry_id="1-1",
+        id="j",
+        payload=None,
+        created=time.time() + server_ahead,
+        deadline=time.time() + server_ahead + 100,
+        clock_offset=server_ahead,
+    )
+    assert job.remaining is not None
+    assert 95 < job.remaining <= 100
 
 
 async def test_run_twice_is_rejected(async_redis_client):

@@ -23,8 +23,9 @@
   pending list; a live worker touches its jobs, so after reclaim_idle without
   that the queue's leader reclaims and re-runs them (delivery is
   at-least-once; ``job.reclaimed`` tells the handler).
-- Deadlines are wall-clock (time.time()): process clocks must be NTP-synced.
-- Requires Redis >= 6.2 (XAUTOCLAIM); both RESP2 and RESP3 clients work.
+- Timestamps and deadlines come from the Redis server clock (stamped inside
+  the enqueue script), like the rest of the library: no NTP sync needed.
+- Requires Redis >= 6.2 (XAUTOCLAIM, BLMOVE); RESP2 and RESP3 clients work.
 """
 
 from __future__ import annotations
@@ -77,9 +78,11 @@ class Job:
         queue: Queue name.
         id: Unique job id (stable across re-runs; use it for idempotency).
         payload: The JSON payload given to submit().
-        created: Epoch seconds when the job was submitted.
-        deadline: Epoch seconds after which the submitter stops waiting, or
-            None. A handler waiting for a resource should give up past it.
+        created: Epoch seconds when the job was submitted (Redis server
+            clock, stamped inside the enqueue script - no NTP sync needed).
+        deadline: Epoch seconds (server clock) after which the submitter
+            stops waiting, or None. A handler waiting for a resource should
+            give up past it; compare via :attr:`remaining`, not time.time().
         reclaimed: True if the job runs again: after the handler raised
             RequeueJob, or taken over from a worker presumed dead (then it
             may have run partly or fully before).
@@ -87,6 +90,7 @@ class Job:
 
     __slots__ = (
         "_admitted",
+        "_clock_offset",
         "_settled",
         "created",
         "deadline",
@@ -106,6 +110,7 @@ class Job:
         created: float,
         deadline: float | None,
         reclaimed: bool = False,
+        clock_offset: float = 0.0,
     ) -> None:
         self.queue = queue
         self.entry_id = entry_id
@@ -114,6 +119,9 @@ class Job:
         self.created = created
         self.deadline = deadline
         self.reclaimed = reclaimed
+        # Server minus local clock, measured by the worker: deadlines are
+        # server-clock epochs, the local clock alone may be skewed.
+        self._clock_offset = clock_offset
         self._admitted = False
         # Set on admit() or when the handler finishes: the queue may move on.
         self._settled = asyncio.Event()
@@ -129,10 +137,15 @@ class Job:
 
     @property
     def remaining(self) -> float | None:
-        """Seconds until the deadline (may be negative), or None without one."""
+        """Seconds until the deadline (may be negative), or None without one.
+
+        Estimated against the Redis server clock (the worker measures the
+        local-to-server offset periodically), so it is meaningful even when
+        this machine's wall clock is skewed.
+        """
         if self.deadline is None:
             return None
-        return self.deadline - time.time()
+        return self.deadline - (time.time() + self._clock_offset)
 
     def __repr__(self) -> str:
         return f"Job(queue={self.queue!r}, id={self.id!r}, admitted={self._admitted})"
@@ -254,19 +267,6 @@ class DispatchQueue:
         """Redis key of the queue's stream."""
         return self._keys.stream(queue)
 
-    def _fields(self, job_id: str, payload: Any, timeout: float | None) -> list[str]:
-        now = time.time()
-        return [
-            "id",
-            job_id,
-            "payload",
-            json.dumps(payload),
-            "created",
-            repr(now),
-            "deadline",
-            "" if timeout is None else repr(now + timeout),
-        ]
-
     def _check_args(self, queue: str, timeout: float | None) -> None:
         _check_queue_name(queue)
         if timeout is not None and timeout <= 0:
@@ -301,7 +301,6 @@ class DispatchQueue:
         """
         self._check_args(queue, timeout)
         job_id = uuid.uuid4().hex
-        fields = self._fields(job_id, payload, timeout)
         with backend_errors("dispatch_submit", queue):
             entry_id = await self._runner.dispatch_enqueue_async(
                 self._script_client,
@@ -309,7 +308,9 @@ class DispatchQueue:
                 self._keys.submit_marker(queue, job_id),
                 self._config.max_queue_size or 0,
                 int(self._config.reply_ttl * 1000),
-                fields,
+                job_id,
+                json.dumps(payload),
+                "" if timeout is None else int(timeout * 1000),
             )
             if entry_id is None:
                 raise self._full(queue)
@@ -346,7 +347,6 @@ class DispatchQueue:
         """Sync version of :meth:`asubmit` (needs a sync client)."""
         self._check_args(queue, timeout)
         job_id = uuid.uuid4().hex
-        fields = self._fields(job_id, payload, timeout)
         with backend_errors("dispatch_submit", queue):
             entry_id = self._runner.dispatch_enqueue(
                 self._script_client,
@@ -354,7 +354,9 @@ class DispatchQueue:
                 self._keys.submit_marker(queue, job_id),
                 self._config.max_queue_size or 0,
                 int(self._config.reply_ttl * 1000),
-                fields,
+                job_id,
+                json.dumps(payload),
+                "" if timeout is None else int(timeout * 1000),
             )
             if entry_id is None:
                 raise self._full(queue)
@@ -516,6 +518,9 @@ class DispatchWorker:
         # A permanent backend error (ACL, unsupported command): re-electing
         # would fail the same way forever, so run() stops and raises it.
         self._fatal: BackendError | None = None
+        # Server minus local clock, refreshed on every reclaim tick: created/
+        # deadline are server-clock epochs, local wall clocks may be skewed.
+        self._clock_offset = 0.0
         self._leading: dict[str, asyncio.Task[None]] = {}
         self._handlers: set[asyncio.Task[None]] = set()
         # stream -> entry ids taken by this worker and not answered yet
@@ -801,6 +806,8 @@ class DispatchWorker:
         Returns the reclaimed entries and the XAUTOCLAIM cursor to continue
         from ("0-0" once the whole pending list has been scanned).
         """
+        server_sec, server_usec = await self._client.time()
+        self._clock_offset = server_sec + server_usec / 1e6 - time.time()
         try:
             reply = await self._client.xautoclaim(
                 stream,
@@ -957,17 +964,17 @@ class DispatchWorker:
             return  # it got admitted or finished meanwhile
         await self._hand_back(stream, [job.entry_id])
 
-    @staticmethod
-    def _decode(queue: str, entry_id: str, fields: dict[Any, Any], reclaimed: bool) -> Job:
+    def _decode(self, queue: str, entry_id: str, fields: dict[Any, Any], reclaimed: bool) -> Job:
         data = {_text(key): _text(value) for key, value in fields.items()}
         return Job(
             queue=queue,
             entry_id=entry_id,
             id=data["id"],
             payload=json.loads(data["payload"]),
-            created=float(data["created"]),
-            deadline=float(data["deadline"]) if data["deadline"] else None,
+            created=float(data["created"]) / 1000,
+            deadline=float(data["deadline"]) / 1000 if data["deadline"] else None,
             reclaimed=reclaimed,
+            clock_offset=self._clock_offset,
         )
 
     async def _run_job(self, stream: str, job: Job) -> None:
