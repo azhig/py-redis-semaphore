@@ -360,6 +360,59 @@ async def test_long_running_job_is_not_reclaimed(async_redis_client):
     assert calls == [False]
 
 
+async def test_live_job_is_not_reclaimed_by_its_own_worker(async_redis_client, monkeypatch):
+    """When the touch loop falls behind, XAUTOCLAIM hands the worker its own
+    still-running job; it must not be started a second time."""
+    calls = []
+
+    async def handler(job: Job):
+        calls.append(job.reclaimed)
+        job.admit()
+        await asyncio.sleep(1.5)  # > reclaim_idle, and never touched
+        return "slow"
+
+    async def no_touch(self):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(DispatchWorker, "_touch_loop", no_touch)
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    async with running(DispatchWorker(async_redis_client, ["self-reclaim"], handler, config)):
+        assert await queue.asubmit("self-reclaim", None, timeout=10) == "slow"
+    assert calls == [False]
+
+
+async def test_second_cancel_still_cleans_up(async_redis_client):
+    """asyncio.wait_for(run, grace)-style double cancellation must not abort
+    the cleanup halfway (leaked handlers, leadership held until its TTL)."""
+    started = asyncio.Event()
+
+    async def handler(job: Job):
+        job.admit()
+        started.set()
+        await asyncio.sleep(30)  # runs until the hard shutdown cancels it
+        return "never"
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    worker = DispatchWorker(async_redis_client, ["grace"], handler, config)
+    run = asyncio.create_task(worker.run())
+    submit = asyncio.create_task(queue.asubmit("grace", None, timeout=30))
+    await asyncio.wait_for(started.wait(), 5)
+    run.cancel()  # first cancel: graceful, would wait for the admitted handler
+    with pytest.raises((asyncio.TimeoutError, asyncio.CancelledError)):
+        await asyncio.wait_for(run, timeout=0.3)  # grace elapsed: second cancel
+    assert worker.health().running is False
+    assert worker.leading == []
+    # Cleanup ran to completion: the worker is reusable.
+    run2 = asyncio.create_task(worker.run())
+    await until(lambda: worker.leading == ["grace"])
+    worker.stop()
+    await asyncio.wait_for(run2, 5)
+    submit.cancel()
+    await asyncio.gather(submit, return_exceptions=True)
+
+
 async def test_lost_leadership_hands_back_unadmitted_job(async_redis_client):
     """A job waiting for admission on a leader that lost its Mutex is re-run."""
     calls = []

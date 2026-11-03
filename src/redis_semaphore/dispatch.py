@@ -506,6 +506,10 @@ class DispatchWorker:
         self._block_cap = _block_cap(client)
         self._stopping = asyncio.Event()
         self._running = False
+        # Orders touch-loop XCLAIMs against _hand_back's: a touch landing after
+        # the hand-back would reset the idle time it set and hide the entry
+        # from reclaim for another reclaim_idle.
+        self._claim_lock = asyncio.Lock()
         # Health: last main loop tick and last Redis error (monotonic time).
         self._last_loop: float | None = None
         self._last_error: tuple[float, str] | None = None
@@ -589,17 +593,45 @@ class DispatchWorker:
                     await asyncio.wait_for(self._stopping.wait(), timeout=pause)
         finally:
             self._stopping.set()
-            await asyncio.gather(*self._leading.values(), return_exceptions=True)
-            await asyncio.gather(*self._handlers, return_exceptions=True)
-            touch.cancel()
-            await asyncio.gather(touch, return_exceptions=True)
-            self._leading.clear()
-            self._stopping.clear()
-            self._running = False
-            self._last_loop = None
+            await self._shutdown(touch)
         if self._fatal is not None:
             fatal, self._fatal = self._fatal, None
             raise fatal
+
+    async def _shutdown(self, touch: asyncio.Task[None]) -> None:
+        """Finish the cleanup even if cancelled again meanwhile.
+
+        A second cancellation (``asyncio.wait_for(task, grace)`` issues exactly
+        that) must not abort the cleanup halfway: that would leak running
+        handlers, keep the consumer registered and hold leadership until its
+        TTL. Instead it hardens the shutdown - handlers are cancelled - and
+        the rest of the cleanup still runs; the cancellation is re-raised once
+        the worker is back in a clean state.
+        """
+        steps = asyncio.ensure_future(self._shutdown_steps(touch))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(steps)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if steps.done():
+                    break
+                for task in self._handlers:
+                    task.cancel()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown_steps(self, touch: asyncio.Task[None]) -> None:
+        await asyncio.gather(*self._leading.values(), return_exceptions=True)
+        await asyncio.gather(*self._handlers, return_exceptions=True)
+        touch.cancel()
+        await asyncio.gather(touch, return_exceptions=True)
+        self._leading.clear()
+        self._stopping.clear()
+        self._running = False
+        self._last_loop = None
 
     def _stop_fatally(self, error: BackendError, queue: str) -> None:
         """A permanent error would repeat on every election: stop, don't thrash."""
@@ -787,7 +819,18 @@ class DispatchWorker:
                 ) from exc
             raise
         cursor = _text(reply[0])
-        entries = list(reply[1])
+        # Jobs this worker is handling right now must not be re-run: the touch
+        # loop can fall behind (network hiccup, stalled event loop) for longer
+        # than reclaim_idle, and XAUTOCLAIM would then hand the worker its own
+        # live job a second time. The claim transfer is harmless (we own them
+        # already, and the idle reset doubles as a touch) - running them again
+        # is not.
+        taken = self._taken.get(stream, set())
+        entries = [
+            (entry_id, fields)
+            for entry_id, fields in reply[1]
+            if entry_id is None or _text(entry_id) not in taken
+        ]
         now = time.monotonic()
         abandoned = 0
         for entry_id, _ in entries:
@@ -815,12 +858,16 @@ class DispatchWorker:
         while True:
             await asyncio.sleep(self._config.reclaim_idle / 3)
             for stream, ids in list(self._taken.items()):
-                if not ids:
-                    continue
                 try:
-                    await self._client.xclaim(
-                        stream, self._config.group, self.id, 0, list(ids), justid=True
-                    )
+                    async with self._claim_lock:
+                        # Re-snapshot under the lock: entries handed back while
+                        # we waited for it must not be touched again.
+                        current = list(ids)
+                        if not current:
+                            continue
+                        await self._client.xclaim(
+                            stream, self._config.group, self.id, 0, current, justid=True
+                        )
                 except (redis.RedisError, OSError):
                     logger.warning("Worker %s failed to touch jobs in %s", self.id, stream)
 
@@ -833,15 +880,16 @@ class DispatchWorker:
         if not entry_ids:
             return
         try:
-            await self._client.xclaim(
-                stream,
-                self._config.group,
-                self.id,
-                0,
-                entry_ids,
-                idle=int(self._config.reclaim_idle * 1000),
-                justid=True,
-            )
+            async with self._claim_lock:
+                await self._client.xclaim(
+                    stream,
+                    self._config.group,
+                    self.id,
+                    0,
+                    entry_ids,
+                    idle=int(self._config.reclaim_idle * 1000),
+                    justid=True,
+                )
         except (redis.RedisError, OSError):
             logger.debug("Worker %s: hand back failed", self.id, exc_info=True)
 
