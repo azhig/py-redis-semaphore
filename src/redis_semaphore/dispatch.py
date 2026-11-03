@@ -24,6 +24,7 @@
   that the queue's leader reclaims and re-runs them (delivery is
   at-least-once; ``job.reclaimed`` tells the handler).
 - Deadlines are wall-clock (time.time()): process clocks must be NTP-synced.
+- Requires Redis >= 6.2 (XAUTOCLAIM); both RESP2 and RESP3 clients work.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ import redis.asyncio as aioredis
 
 from .errors import (
     BackendError,
+    CommandDeniedError,
     JobError,
     JobFailedError,
     JobTimeoutError,
@@ -485,6 +487,9 @@ class DispatchWorker:
         # Health: last main loop tick and last Redis error (monotonic time).
         self._last_loop: float | None = None
         self._last_error: tuple[float, str] | None = None
+        # A permanent backend error (ACL, unsupported command): re-electing
+        # would fail the same way forever, so run() stops and raises it.
+        self._fatal: BackendError | None = None
         self._leading: dict[str, asyncio.Task[None]] = {}
         self._handlers: set[asyncio.Task[None]] = set()
         # stream -> entry ids taken by this worker and not answered yet
@@ -542,6 +547,10 @@ class DispatchWorker:
         On shutdown jobs not admitted yet are handed back (their handlers are
         cancelled and the next leader picks them up at once); admitted jobs
         run to completion.
+
+        Raises:
+            PermanentBackendError: Leading failed in a way a re-election would
+                repeat forever (ACL denial, Redis < 6.2 without XAUTOCLAIM).
         """
         if self._running:
             raise RuntimeError("DispatchWorker.run() is already running")
@@ -566,6 +575,18 @@ class DispatchWorker:
             self._stopping.clear()
             self._running = False
             self._last_loop = None
+        if self._fatal is not None:
+            fatal, self._fatal = self._fatal, None
+            raise fatal
+
+    def _stop_fatally(self, error: BackendError, queue: str) -> None:
+        """A permanent error would repeat on every election: stop, don't thrash."""
+        logger.error(
+            "Worker %s: queue '%s' failed permanently, stopping: %s", self.id, queue, error
+        )
+        if self._fatal is None:
+            self._fatal = error
+        self._stopping.set()
 
     async def _elect(self) -> None:
         """Try to take one more free queue (one per round spreads queues)."""
@@ -586,8 +607,13 @@ class DispatchWorker:
             try:
                 acquired = (await mutex.aacquire(blocking=False)).success
             except Exception as exc:
-                logger.warning("Worker %s: election for '%s' failed", self.id, queue, exc_info=True)
                 self._record_error(exc)
+                if isinstance(exc, BackendError) and not exc.is_transient:
+                    self._stop_fatally(exc, queue)
+                else:
+                    logger.warning(
+                        "Worker %s: election for '%s' failed", self.id, queue, exc_info=True
+                    )
                 return
             self._last_error = None  # Redis answered
             if acquired:
@@ -640,8 +666,16 @@ class DispatchWorker:
                         if entry_id is not None:
                             taken.discard(_text(entry_id))
         except (redis.RedisError, OSError, BackendError) as exc:
-            logger.warning("Worker %s: leading '%s' failed", self.id, queue, exc_info=True)
             self._record_error(exc)
+            mapped = (
+                exc
+                if isinstance(exc, BackendError)
+                else map_backend_error(exc, operation="dispatch_lead", name=queue)
+            )
+            if mapped.is_transient:
+                logger.warning("Worker %s: leading '%s' failed", self.id, queue, exc_info=True)
+            else:
+                self._stop_fatally(mapped, queue)
         finally:
             if mutex.is_acquired:
                 try:
@@ -668,7 +702,17 @@ class DispatchWorker:
                 raise
             await self._ensure_group(stream)  # the stream was deleted meanwhile
             return []
-        return list(response[0][1]) if response else []
+        return self._entries(response)
+
+    @staticmethod
+    def _entries(response: Any) -> list[tuple[Any, Any]]:
+        """Entries of an XREADGROUP reply: RESP2 is a list of (stream, entries)
+        pairs, RESP3 (protocol=3) a dict of entry batches per stream."""
+        if not response:
+            return []
+        if isinstance(response, dict):
+            return [entry for batch in next(iter(response.values())) for entry in batch]
+        return list(response[0][1])
 
     async def _reclaim(
         self, stream: str, start_id: str = "0-0"
@@ -678,14 +722,23 @@ class DispatchWorker:
         Returns the reclaimed entries and the XAUTOCLAIM cursor to continue
         from ("0-0" once the whole pending list has been scanned).
         """
-        reply = await self._client.xautoclaim(
-            stream,
-            self._config.group,
-            self.id,
-            min_idle_time=int(self._config.reclaim_idle * 1000),
-            start_id=start_id,
-            count=100,
-        )
+        try:
+            reply = await self._client.xautoclaim(
+                stream,
+                self._config.group,
+                self.id,
+                min_idle_time=int(self._config.reclaim_idle * 1000),
+                start_id=start_id,
+                count=100,
+            )
+        except redis.ResponseError as exc:
+            if "unknown command" in str(exc).lower():
+                raise CommandDeniedError(
+                    f"DispatchWorker requires Redis >= 6.2 (XAUTOCLAIM): {exc}",
+                    operation="dispatch_reclaim",
+                    original=exc,
+                ) from exc
+            raise
         cursor = _text(reply[0])
         entries = list(reply[1])
         now = time.monotonic()
@@ -726,6 +779,8 @@ class DispatchWorker:
 
     async def _hand_back(self, stream: str, entry_ids: list[Any]) -> None:
         """Make taken-but-unstarted jobs reclaimable by the next leader right away."""
+        # Redis 6.2 XAUTOCLAIM reports entries deleted while pending as nil ids.
+        entry_ids = [entry_id for entry_id in entry_ids if entry_id is not None]
         for entry_id in entry_ids:
             self._taken.get(stream, set()).discard(_text(entry_id))
         if not entry_ids:

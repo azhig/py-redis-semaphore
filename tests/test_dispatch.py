@@ -444,6 +444,34 @@ async def test_run_twice_is_rejected(async_redis_client):
             await worker.run()
 
 
+async def test_resp3_client_roundtrip(async_resp3_client):
+    """RESP3 (protocol=3) XREADGROUP replies are dicts; the worker must cope."""
+    config = _config()
+    queue = DispatchQueue(async_resp3_client, config)
+    async with running(DispatchWorker(async_resp3_client, ["resp3"], echo, config)):
+        for i in range(3):
+            result = await queue.asubmit("resp3", {"i": i}, timeout=5)
+            assert result["payload"] == {"i": i}
+    assert await queue.alength("resp3") == 0
+
+
+async def test_redis_without_xautoclaim_stops_worker(async_redis_client, monkeypatch):
+    """On Redis < 6.2 the worker stops with a clear permanent error instead of
+    thrashing through endless re-elections."""
+    import redis as redis_pkg
+
+    from redis_semaphore.errors import CommandDeniedError
+
+    async def no_xautoclaim(*args, **kwargs):
+        raise redis_pkg.ResponseError("ERR unknown command 'XAUTOCLAIM'")
+
+    monkeypatch.setattr(async_redis_client, "xautoclaim", no_xautoclaim)
+    worker = DispatchWorker(async_redis_client, ["old-redis"], echo, _config())
+    with pytest.raises(CommandDeniedError, match="6.2"):
+        await asyncio.wait_for(worker.run(), 10)
+    assert worker.health().running is False
+
+
 async def test_worker_survives_redis_errors(async_redis_client):
     """A failing leader gives up its queue; the worker re-elects later."""
     config = _config()

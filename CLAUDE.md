@@ -116,3 +116,4 @@ REDIS_SENTINEL_PASSWORD=secret            # Sentinel password
 - No first-class Redis Cluster support (only Sentinel); `cluster_hash_tags=True` makes the key layout Cluster-slot-compatible
 - No Redlock for multi-master setups
 - NTP synchronization between clients is only required with `time_source=TimeSource.CLIENT`; the default SERVER mode reads time inside the Lua scripts (needs Redis >= 3.2)
+- `DispatchQueue`/`DispatchWorker` require Redis >= 6.2 (XAUTOCLAIM, BLMOVE); the rest of the library works from Redis 3.2

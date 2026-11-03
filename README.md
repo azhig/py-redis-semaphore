@@ -154,6 +154,7 @@ per-agent queues spreading load over several certificates.
 requests. When many processes or pods share a quota and requests must get it
 in arrival order, put them into a shared queue: `DispatchQueue` (producers)
 and `DispatchWorker` (consumers) keep one FIFO queue per name in Redis.
+Requires Redis >= 6.2 (the rest of the library only needs >= 3.2).
 
 ```python
 from redis_semaphore import DispatchConfig, DispatchQueue, DispatchWorker, Job
