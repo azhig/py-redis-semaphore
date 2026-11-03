@@ -295,15 +295,20 @@ def test_retried_adjust_does_not_double_count(redis_client):
 
 
 def test_retried_acquire_does_not_double_count(redis_client):
-    """An acquire resent after a lost reply (client auto-retry) charges once."""
+    """An acquire resent after a lost reply (client auto-retry) charges once.
+
+    The cost is over half the limit on purpose: the resent call must not be
+    denied against its own first attempt either (used + cost > limit).
+    """
     limiter = _limiter(redis_client, "acquire-retry", requests=10, tokens=100)
-    costs = {"requests": 1, "tokens": 30}
+    costs = {"requests": 1, "tokens": 60}
     first = limiter._try_acquire(costs, "retry-me")
     second = limiter._try_acquire(costs, "retry-me")  # the resent script call
     assert first.success is True
     assert second.success is True
-    assert limiter.status().usage["tokens"].used == 30
-    assert int(redis_client.get(limiter.total_key("tokens"))) == 30
+    assert second.used["tokens"] == 60
+    assert limiter.status().usage["tokens"].used == 60
+    assert int(redis_client.get(limiter.total_key("tokens"))) == 60
     assert redis_client.zcard(limiter.log_key("tokens")) == 1
 
 

@@ -510,9 +510,11 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         if remaining is not None:
             timeout = min(timeout, remaining)
         if timeout < 0.01:
+            if remaining is not None and remaining < 0.01:
+                return 0.0  # the acquire deadline is upon us: skip the wait
             # Redis before 7.0 truncates sub-ms timeouts to 0 = block forever;
-            # a wait this short is better skipped (the acquire loop re-checks).
-            return 0.0
+            # clamp up rather than skipping, which would busy-loop acquire.
+            return 0.01
         return timeout
 
     def _on_transient_wait_error(self, exc: BaseException) -> float:

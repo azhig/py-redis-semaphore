@@ -520,6 +520,8 @@ async def test_second_cancel_still_cleans_up(async_redis_client):
     async def handler(job: Job):
         job.admit()
         started.set()
+        if job.reclaimed:
+            return "after-restart"
         await asyncio.sleep(30)  # runs until the hard shutdown cancels it
         return "never"
 
@@ -534,13 +536,78 @@ async def test_second_cancel_still_cleans_up(async_redis_client):
         await asyncio.wait_for(run, timeout=0.3)  # grace elapsed: second cancel
     assert worker.health().running is False
     assert worker.leading == []
-    # Cleanup ran to completion: the worker is reusable.
+    assert not worker._taken  # no stale ids for the next run's touch loop
+    # Cleanup ran to completion: the worker is reusable, and the job cut off
+    # by the hard shutdown is reclaimed and finished by the restarted worker.
     run2 = asyncio.create_task(worker.run())
     await until(lambda: worker.leading == ["grace"])
+    assert await asyncio.wait_for(submit, 10) == "after-restart"
     worker.stop()
     await asyncio.wait_for(run2, 5)
+
+
+async def test_hard_stop_hands_back_unadmitted_job(async_redis_client):
+    """A hard shutdown (second cancel) hands non-admitted entries back right
+    away instead of parking them for reclaim_idle, and clears _taken so a
+    restarted worker does not keep touching entries it no longer handles."""
+    taken = asyncio.Event()
+
+    async def handler(job: Job):
+        taken.set()
+        await asyncio.Event().wait()  # never admitted
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    worker = DispatchWorker(async_redis_client, ["hard"], handler, config)
+    run = asyncio.create_task(worker.run())
+    submit = asyncio.create_task(queue.asubmit("hard", None, timeout=30))
+    await asyncio.wait_for(taken.wait(), 5)
+    run.cancel()
+    with pytest.raises((asyncio.TimeoutError, asyncio.CancelledError)):
+        await asyncio.wait_for(run, timeout=0.1)  # grace elapsed: second cancel
+    assert not worker._taken
+    pending = await async_redis_client.xpending_range(
+        queue.stream_key("hard"), config.group, "-", "+", 10
+    )
+    assert len(pending) == 1
+    # Handed back: the idle time was bumped to reclaim_idle for instant reclaim.
+    assert pending[0]["time_since_delivered"] >= config.reclaim_idle * 1000 - 50
     submit.cancel()
     await asyncio.gather(submit, return_exceptions=True)
+
+
+async def test_deleted_stream_is_recreated_not_fatal(async_redis_client):
+    """An operator deleting a queue stream (NOGROUP on reclaim/backlog) must
+    not kill the worker: the group is re-created and work continues."""
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    async with running(DispatchWorker(async_redis_client, ["vanish"], echo, config)):
+        assert (await queue.asubmit("vanish", 1, timeout=5))["payload"] == 1
+        await async_redis_client.delete(queue.stream_key("vanish"))
+        await asyncio.sleep(0.3)  # several reclaim ticks on the deleted stream
+        assert (await queue.asubmit("vanish", 2, timeout=5))["payload"] == 2
+
+
+def test_only_acl_and_unknown_command_are_fatal():
+    """One-off server errors (OOM, failover, busy script, deleted stream)
+    must re-elect, not stop every worker of the fleet at once."""
+    import redis.exceptions as rexc
+
+    from redis_semaphore.errors import map_backend_error
+
+    def fatal(exc):
+        return DispatchWorker._is_fatal(map_backend_error(exc))
+
+    assert fatal(rexc.NoPermissionError("NOPERM this user has no permissions")) is True
+    assert fatal(rexc.ResponseError("ERR unknown command 'XAUTOCLAIM'")) is True
+    for message in (
+        "OOM command not allowed when used memory > 'maxmemory'",
+        "MASTERDOWN Link with MASTER is down",
+        "BUSY Redis is busy running a script",
+        "NOGROUP No such key 'x' or consumer group 'g'",
+        "CLUSTERDOWN The cluster is down",
+    ):
+        assert fatal(rexc.ResponseError(message)) is False
 
 
 async def test_lost_leadership_hands_back_unadmitted_job(async_redis_client):

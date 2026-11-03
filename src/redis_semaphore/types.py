@@ -353,7 +353,9 @@ class DispatchConfig:
             one more free queue (None = leader_ttl / 3). Every attempt on a
             busy queue is a failed non-blocking Mutex acquire - it shows up
             in the semaphore metrics as result="busy" - and probing much
-            faster than leader_ttl buys nothing, so keep this coarse.
+            faster than leader_ttl buys nothing, so keep this coarse. After
+            a successful take the pause is skipped, so covering many free
+            queues at startup does not depend on this interval.
         max_admitted: Max admitted jobs of one queue running concurrently on
             its leader (None = unlimited). At the cap the leader waits for a
             handler to finish before starting the next job (FIFO is kept).

@@ -324,8 +324,12 @@ local identifier = ARGV[1]
 local n = #KEYS / 2
 local used = {}
 local retry_after = 0
+local already = false
 
 -- 1. Evict expired entries and check every limit (nothing is written yet).
+-- A resent acquire (the client retried after losing the reply) finds its own
+-- member already recorded: it must be reported admitted again, not denied
+-- against its own first attempt (phase 2 then leaves the totals unchanged).
 for i = 1, n do
     local log_key, total_key = KEYS[2 * i - 1], KEYS[2 * i]
     local base = 3 + (i - 1) * 3
@@ -334,7 +338,10 @@ for i = 1, n do
     local cost = tonumber(ARGV[base + 2])
     local total = evict(log_key, total_key, now_ms - window_ms, window_ms * 2)
     used[i] = total
-    if cost > 0 and total + cost > limit then
+    if cost > 0 and redis.call('ZSCORE', log_key, ARGV[base + 2] .. ':' .. identifier) then
+        already = true
+    end
+    if cost > 0 and not already and total + cost > limit then
         -- Walk the log oldest-first (in chunks, stopping early) until enough
         -- units would have expired.
         local need = total + cost - limit

@@ -638,8 +638,12 @@ class DispatchWorker:
         try:
             while not self._stopping.is_set():
                 self._last_loop = time.monotonic()
-                await self._elect()
-                pause = self._election_interval * random.uniform(0.5, 1.5)
+                if await self._elect():
+                    # Took a queue: grab the next free one almost at once, so
+                    # covering many queues does not take Q * election_interval.
+                    pause = self._election_interval * random.uniform(0.0, 0.1)
+                else:
+                    pause = self._election_interval * random.uniform(0.5, 1.5)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=pause)
         finally:
@@ -680,9 +684,30 @@ class DispatchWorker:
         touch.cancel()
         await asyncio.gather(touch, return_exceptions=True)
         self._leading.clear()
+        # Clear per-run state: stale _taken ids surviving into the next run()
+        # would make the touch loop re-claim entries this worker no longer
+        # handles (idle 0 forever = nobody could ever reclaim them).
+        self._taken.clear()
+        self._stream_handlers.clear()
+        self._requeued.clear()
+        self._reclaim_now.clear()
+        self._next_prune.clear()
         self._stopping.clear()
         self._running = False
         self._last_loop = None
+
+    @staticmethod
+    def _is_fatal(error: BackendError) -> bool:
+        """Only errors every future leader would hit again stop the worker:
+        an ACL denial or a missing command (Redis < 6.2). Everything else -
+        OOM, MASTERDOWN mid-failover, BUSY scripts, a deleted stream
+        (NOGROUP), connection trouble - is recoverable: drop leadership, log
+        and re-elect, as a one-off server hiccup must not take down every
+        worker of the fleet at once.
+        """
+        if isinstance(error.original, redis.exceptions.NoPermissionError):
+            return True
+        return "unknown command" in str(error).lower()
 
     def _stop_fatally(self, error: BackendError, queue: str) -> None:
         """A permanent error would repeat on every election: stop, don't thrash."""
@@ -693,12 +718,17 @@ class DispatchWorker:
             self._fatal = error
         self._stopping.set()
 
-    async def _elect(self) -> None:
-        """Try to take one more free queue (one per round spreads queues)."""
+    async def _elect(self) -> bool:
+        """Try to take one more free queue; True if one was taken.
+
+        One queue per call spreads queues over workers; the caller skips the
+        election pause after a success, so startup coverage of many queues
+        does not depend on election_interval.
+        """
         self._leading = {q: t for q, t in self._leading.items() if not t.done()}
         cap = self._config.max_queues_per_worker
         if cap is not None and len(self._leading) >= cap:
-            return
+            return False
         free = [queue for queue in self._queues if queue not in self._leading]
         random.shuffle(free)
         for queue in free:
@@ -713,18 +743,19 @@ class DispatchWorker:
                 acquired = (await mutex.aacquire(blocking=False)).success
             except Exception as exc:
                 self._record_error(exc)
-                if isinstance(exc, BackendError) and not exc.is_transient:
+                if isinstance(exc, BackendError) and self._is_fatal(exc):
                     self._stop_fatally(exc, queue)
                 else:
                     logger.warning(
                         "Worker %s: election for '%s' failed", self.id, queue, exc_info=True
                     )
-                return
+                return False
             self._last_error = None  # Redis answered
             if acquired:
                 logger.info("Worker %s leads queue '%s'", self.id, queue)
                 self._leading[queue] = asyncio.create_task(self._lead(queue, mutex))
-                return
+                return True
+        return False
 
     # -- leading a queue ------------------------------------------------------
 
@@ -782,10 +813,10 @@ class DispatchWorker:
                 if isinstance(exc, BackendError)
                 else map_backend_error(exc, operation="dispatch_lead", name=queue)
             )
-            if mapped.is_transient:
-                logger.warning("Worker %s: leading '%s' failed", self.id, queue, exc_info=True)
-            else:
+            if self._is_fatal(mapped):
                 self._stop_fatally(mapped, queue)
+            else:
+                logger.warning("Worker %s: leading '%s' failed", self.id, queue, exc_info=True)
         finally:
             if mutex.is_acquired:
                 try:
@@ -834,10 +865,20 @@ class DispatchWorker:
         reclaimed: the entry may also come from a _finish() that failed after
         the handler ran, so a re-run must be flagged.
         """
-        response = await self._client.xreadgroup(
-            self._config.group, self.id, {stream: "0"}, count=100
-        )
-        taken = self._taken.get(stream, set())
+        # Snapshot BEFORE the read: a job finishing (XACK+XDEL, then discard)
+        # while the reply is in flight must still be filtered out - its
+        # delivery in this reply predates the finish. The count leaves room
+        # for a lost delivery behind every currently-taken entry.
+        taken = set(self._taken.get(stream, ()))
+        try:
+            response = await self._client.xreadgroup(
+                self._config.group, self.id, {stream: "0"}, count=len(taken) + 100
+            )
+        except redis.ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            await self._ensure_group(stream)  # the stream was deleted meanwhile
+            return []
         return [
             (entry_id, fields)
             for entry_id, fields in self._entries(response)
@@ -852,6 +893,10 @@ class DispatchWorker:
         Returns the reclaimed entries and the XAUTOCLAIM cursor to continue
         from ("0-0" once the whole pending list has been scanned).
         """
+        # Snapshot before any await, for the same in-flight-finish race as in
+        # _backlog: a job that finishes while the XAUTOCLAIM reply travels
+        # must still be filtered out.
+        taken = set(self._taken.get(stream, ()))
         server_sec, server_usec = await self._client.time()
         self._clock_offset = server_sec + server_usec / 1e6 - time.time()
         try:
@@ -870,6 +915,9 @@ class DispatchWorker:
                     operation="dispatch_reclaim",
                     original=exc,
                 ) from exc
+            if "NOGROUP" in str(exc):
+                await self._ensure_group(stream)  # the stream was deleted meanwhile
+                return [], "0-0"
             raise
         cursor = _text(reply[0])
         # Jobs this worker is handling right now must not be re-run: the touch
@@ -878,7 +926,6 @@ class DispatchWorker:
         # live job a second time. The claim transfer is harmless (we own them
         # already, and the idle reset doubles as a touch) - running them again
         # is not.
-        taken = self._taken.get(stream, set())
         entries = [
             (entry_id, fields)
             for entry_id, fields in reply[1]
@@ -905,7 +952,13 @@ class DispatchWorker:
             # Pruning dead consumers is bookkeeping: one XINFO per
             # reclaim_idle is plenty, no need for one per reclaim tick.
             self._next_prune[stream] = time.monotonic() + self._config.reclaim_idle
-            for consumer in await self._client.xinfo_consumers(stream, self._config.group):
+            try:
+                consumers = await self._client.xinfo_consumers(stream, self._config.group)
+            except redis.ResponseError as exc:
+                if "NOGROUP" not in str(exc):
+                    raise
+                consumers = []  # the stream was deleted meanwhile
+            for consumer in consumers:
                 name = _text(consumer["name"])
                 idle_ms = self._config.reclaim_idle * 1000
                 if name != self.id and consumer["pending"] == 0 and consumer["idle"] > idle_ms:
@@ -969,7 +1022,9 @@ class DispatchWorker:
             # no id to acknowledge.
             return True
         entry = _text(entry_id)
-        if fields is None:
+        if not fields:
+            # Deleted while pending (XREADGROUP "0" shows these as empty
+            # field maps, Redis 6.2 XAUTOCLAIM as nil): just acknowledge.
             self._taken.get(stream, set()).discard(entry)
             await self._client.xack(stream, self._config.group, entry)
             return True
@@ -1023,6 +1078,12 @@ class DispatchWorker:
             if not job._settled.is_set():
                 await self._abandon(stream, job, task)
             raise
+        if task.cancelled() and not job.admitted:
+            # A hard shutdown cancelled the handler before admission (settling
+            # the job, so the loop above exited normally): hand the entry back
+            # now instead of parking it for reclaim_idle.
+            await self._hand_back(stream, [job.entry_id])
+            return False
         return True
 
     async def _abandon(self, stream: str, job: Job, task: asyncio.Task[None]) -> None:
