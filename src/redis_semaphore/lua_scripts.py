@@ -471,18 +471,27 @@ return used
 # DISPATCH_ENQUEUE - append a job to a queue stream unless it is full
 # =============================================================================
 # KEYS[1] = queue stream key
+# KEYS[2] = submit dedup marker key (same hash slot as the stream)
 # ARGV[1] = max queue size (0 = unbounded)
-# ARGV[2..] = field/value pairs of the stream entry
+# ARGV[2] = dedup marker TTL in ms
+# ARGV[3..] = field/value pairs of the stream entry
 #
-# Returns: the new entry id, or nil if the queue is full.
+# Returns: the new entry id, or nil if the queue is full. XADD with an auto id
+#   is not idempotent, so the entry id is remembered under the marker key: a
+#   resent call (the client retried after losing the reply) returns the id of
+#   the entry it already created instead of appending a duplicate job.
 DISPATCH_ENQUEUE_SCRIPT = """
 -- XADD with an auto id is non-deterministic: Redis 5-6 need effect replication.
 if redis.replicate_commands then redis.replicate_commands() end
+local existing = redis.call('GET', KEYS[2])
+if existing then return existing end
 local max_size = tonumber(ARGV[1])
 if max_size > 0 and redis.call('XLEN', KEYS[1]) >= max_size then
     return false
 end
-return redis.call('XADD', KEYS[1], '*', unpack(ARGV, 2))
+local entry_id = redis.call('XADD', KEYS[1], '*', unpack(ARGV, 3))
+redis.call('SET', KEYS[2], entry_id, 'PX', math.floor(tonumber(ARGV[2])))
+return entry_id
 """
 
 
@@ -826,20 +835,48 @@ class LuaScriptRunner:
         return _parse_int_list(result, len(windows_ms))
 
     def dispatch_enqueue(
-        self, client: ScriptClient, stream_key: str, max_size: int, fields: Sequence[str]
+        self,
+        client: ScriptClient,
+        stream_key: str,
+        marker_key: str,
+        max_size: int,
+        marker_ttl_ms: int,
+        fields: Sequence[str],
     ) -> str | None:
-        """Append a job; returns the entry id, or None if the queue is full."""
+        """Append a job; returns the entry id, or None if the queue is full.
+
+        The marker key makes a retried call return the id it already created
+        instead of appending a duplicate.
+        """
         result: object = client.evalsha(
-            self._registry.get_sha("dispatch_enqueue"), 1, stream_key, max_size, *fields
+            self._registry.get_sha("dispatch_enqueue"),
+            2,
+            stream_key,
+            marker_key,
+            max_size,
+            marker_ttl_ms,
+            *fields,
         )
         return _to_optional_str(result)
 
     async def dispatch_enqueue_async(
-        self, client: ScriptClient, stream_key: str, max_size: int, fields: Sequence[str]
+        self,
+        client: ScriptClient,
+        stream_key: str,
+        marker_key: str,
+        max_size: int,
+        marker_ttl_ms: int,
+        fields: Sequence[str],
     ) -> str | None:
         """Async variant of :meth:`dispatch_enqueue`."""
         result: object = await client.aevalsha(
-            self._registry.get_sha("dispatch_enqueue"), 1, stream_key, max_size, *fields
+            self._registry.get_sha("dispatch_enqueue"),
+            2,
+            stream_key,
+            marker_key,
+            max_size,
+            marker_ttl_ms,
+            *fields,
         )
         return _to_optional_str(result)
 

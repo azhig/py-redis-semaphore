@@ -159,6 +159,10 @@ class _Keys:
     def reply(self, queue: str, job_id: str) -> str:
         return f"{self._prefix(queue)}:reply:{job_id}"
 
+    def submit_marker(self, queue: str, job_id: str) -> str:
+        """Dedup marker of one submit (same hash slot as the stream)."""
+        return f"{self._prefix(queue)}:submit:{job_id}"
+
     @staticmethod
     def leader_name(queue: str) -> str:
         """Name of the queue's leadership Mutex (in the same namespace)."""
@@ -302,7 +306,9 @@ class DispatchQueue:
             entry_id = await self._runner.dispatch_enqueue_async(
                 self._script_client,
                 self._keys.stream(queue),
+                self._keys.submit_marker(queue, job_id),
                 self._config.max_queue_size or 0,
+                int(self._config.reply_ttl * 1000),
                 fields,
             )
             if entry_id is None:
@@ -317,17 +323,24 @@ class DispatchQueue:
                     block = min(block, give_up - time.monotonic())
                     if block <= 0:
                         raise self._timed_out(queue, job_id, timeout)
-                    # Redis rejects exponent notation such as 3e-05 as a timeout.
+                    # Very small timeouts are truncated to 0 (= block forever)
+                    # by Redis before 7.0; keep a sane floor.
                     block = max(block, _MIN_BLOCK)
                 try:
-                    reply = await self._client.blpop([reply_key], timeout=block)  # type: ignore[misc]
+                    # BLMOVE back onto the same list reads without consuming:
+                    # a reply lost in flight is still there for the retry.
+                    reply = await self._client.blmove(
+                        reply_key, reply_key, timeout=block, src="RIGHT", dest="LEFT"
+                    )
                 except (redis.RedisError, OSError) as exc:
                     failing_since = _tolerate_wait_error(exc, queue, failing_since)
                     await asyncio.sleep(_wait_error_pause(give_up))
                     continue
                 failing_since = None
                 if reply is not None:
-                    return _parse_reply(reply[1])
+                    with contextlib.suppress(redis.RedisError, OSError):
+                        await self._client.delete(reply_key)
+                    return _parse_reply(reply)
 
     def submit(self, queue: str, payload: Any = None, *, timeout: float | None = None) -> Any:
         """Sync version of :meth:`asubmit` (needs a sync client)."""
@@ -338,7 +351,9 @@ class DispatchQueue:
             entry_id = self._runner.dispatch_enqueue(
                 self._script_client,
                 self._keys.stream(queue),
+                self._keys.submit_marker(queue, job_id),
                 self._config.max_queue_size or 0,
+                int(self._config.reply_ttl * 1000),
                 fields,
             )
             if entry_id is None:
@@ -353,17 +368,24 @@ class DispatchQueue:
                     block = min(block, give_up - time.monotonic())
                     if block <= 0:
                         raise self._timed_out(queue, job_id, timeout)
-                    # Redis rejects exponent notation such as 3e-05 as a timeout.
+                    # Very small timeouts are truncated to 0 (= block forever)
+                    # by Redis before 7.0; keep a sane floor.
                     block = max(block, _MIN_BLOCK)
                 try:
-                    reply = self._client.blpop([reply_key], timeout=block)
+                    # BLMOVE back onto the same list reads without consuming:
+                    # a reply lost in flight is still there for the retry.
+                    reply = self._client.blmove(
+                        reply_key, reply_key, timeout=block, src="RIGHT", dest="LEFT"
+                    )
                 except (redis.RedisError, OSError) as exc:
                     failing_since = _tolerate_wait_error(exc, queue, failing_since)
                     time.sleep(_wait_error_pause(give_up))
                     continue
                 failing_since = None
                 if reply is not None:
-                    return _parse_reply(reply[1])  # type: ignore[index]
+                    with contextlib.suppress(redis.RedisError, OSError):
+                        self._client.delete(reply_key)
+                    return _parse_reply(reply)  # type: ignore[arg-type]
 
     async def astatus(self, queue: str) -> QueueStatus:
         """Current state of a queue, e.g. for a health check or dashboard.
@@ -639,6 +661,11 @@ class DispatchWorker:
                     if forced:
                         reclaim_cursor = "0-0"
                     entries, reclaim_cursor = await self._reclaim(stream, reclaim_cursor)
+                    if not entries:
+                        # Deliveries this consumer never saw (the client resent
+                        # XREADGROUP after a lost reply) sit in its own PEL:
+                        # pick them up now instead of waiting out reclaim_idle.
+                        entries = await self._backlog(stream)
                     reclaimed = bool(entries)
                     if reclaim_cursor == "0-0":
                         # Whole pending list scanned; otherwise continue at once.
@@ -713,6 +740,26 @@ class DispatchWorker:
         if isinstance(response, dict):
             return [entry for batch in next(iter(response.values())) for entry in batch]
         return list(response[0][1])
+
+    async def _backlog(self, stream: str) -> list[tuple[Any, Any]]:
+        """Own pending entries nobody is working on.
+
+        A delivery whose reply was lost (e.g. redis-py resent XREADGROUP after
+        a timeout) lands in this consumer's PEL unseen; without this check it
+        would run only after reclaim_idle, via self-reclaim, out of order.
+        Entries in _taken are being handled right now and stay out. Treated as
+        reclaimed: the entry may also come from a _finish() that failed after
+        the handler ran, so a re-run must be flagged.
+        """
+        response = await self._client.xreadgroup(
+            self._config.group, self.id, {stream: "0"}, count=100
+        )
+        taken = self._taken.get(stream, set())
+        return [
+            (entry_id, fields)
+            for entry_id, fields in self._entries(response)
+            if entry_id is None or _text(entry_id) not in taken
+        ]
 
     async def _reclaim(
         self, stream: str, start_id: str = "0-0"

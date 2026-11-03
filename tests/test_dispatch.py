@@ -421,19 +421,91 @@ async def test_submit_survives_transient_wait_error(async_redis_client, monkeypa
 
     config = _config()
     queue = DispatchQueue(async_redis_client, config)
-    real_blpop = async_redis_client.blpop
+    real_blmove = async_redis_client.blmove
     failures = {"left": 1}
 
-    async def flaky_blpop(*args, **kwargs):
+    async def flaky_blmove(*args, **kwargs):
         if failures["left"]:
             failures["left"] -= 1
             raise redis.ConnectionError("blip")
-        return await real_blpop(*args, **kwargs)
+        return await real_blmove(*args, **kwargs)
 
-    monkeypatch.setattr(async_redis_client, "blpop", flaky_blpop)
+    monkeypatch.setattr(async_redis_client, "blmove", flaky_blmove)
     async with running(DispatchWorker(async_redis_client, ["blip"], echo, config)):
         assert (await queue.asubmit("blip", "x", timeout=10))["payload"] == "x"
     assert failures["left"] == 0
+
+
+async def test_submit_survives_lost_reply(async_redis_client, monkeypatch):
+    """A reply lost in flight (connection dropped after the server already
+    served the read) is still there for the retry: the read is BLMOVE back
+    onto the same list, not a consuming BLPOP."""
+    import redis
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    real_blmove = async_redis_client.blmove
+    lost = {"left": 1}
+
+    async def lossy_blmove(*args, **kwargs):
+        result = await real_blmove(*args, **kwargs)
+        if result is not None and lost["left"]:
+            lost["left"] -= 1
+            raise redis.ConnectionError("reply lost in flight")
+        return result
+
+    monkeypatch.setattr(async_redis_client, "blmove", lossy_blmove)
+    async with running(DispatchWorker(async_redis_client, ["lossy"], echo, config)):
+        assert (await queue.asubmit("lossy", "x", timeout=10))["payload"] == "x"
+    assert lost["left"] == 0
+
+
+async def test_submit_survives_client_unblock(async_redis_client, monkeypatch):
+    """UNBLOCKED (sent to blocked clients during failovers) is transient:
+    the submitter retries the wait instead of dying with a permanent error."""
+    import redis
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    real_blmove = async_redis_client.blmove
+    kicks = {"left": 1}
+
+    async def kicked_blmove(*args, **kwargs):
+        if kicks["left"]:
+            kicks["left"] -= 1
+            raise redis.ResponseError("UNBLOCKED client unblocked via CLIENT UNBLOCK")
+        return await real_blmove(*args, **kwargs)
+
+    monkeypatch.setattr(async_redis_client, "blmove", kicked_blmove)
+    async with running(DispatchWorker(async_redis_client, ["kicked"], echo, config)):
+        assert (await queue.asubmit("kicked", "x", timeout=10))["payload"] == "x"
+    assert kicks["left"] == 0
+
+
+async def test_retried_enqueue_does_not_duplicate_job(async_redis_client):
+    """An enqueue resent after a lost reply reuses the entry it already made."""
+    from redis_semaphore.lua_scripts import (
+        LuaScriptRegistry,
+        LuaScriptRunner,
+        ScriptClientAdapter,
+    )
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    runner = LuaScriptRunner(LuaScriptRegistry())
+    adapter = ScriptClientAdapter(async_redis_client)
+    fields = queue._fields("job-1", {"x": 1}, timeout=None)
+    args = (
+        queue.stream_key("dup"),
+        queue._keys.submit_marker("dup", "job-1"),
+        0,
+        60_000,
+        fields,
+    )
+    first = await runner.dispatch_enqueue_async(adapter, *args)
+    second = await runner.dispatch_enqueue_async(adapter, *args)  # the resent call
+    assert first == second
+    assert await queue.alength("dup") == 1
 
 
 async def test_run_twice_is_rejected(async_redis_client):

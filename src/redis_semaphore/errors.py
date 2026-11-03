@@ -165,7 +165,9 @@ class PermanentBackendError(BackendError):
 
 
 class RedisConnectionError(TransientBackendError):
-    """Redis is unreachable: connection refused/reset, timeout, loading, readonly."""
+    """Redis is unreachable or the wait was interrupted server-side: connection
+    refused/reset, timeout, loading, readonly, or a blocking command unblocked
+    by CLIENT UNBLOCK (typical during a Sentinel failover)."""
 
 
 class CommandDeniedError(PermanentBackendError):
@@ -194,6 +196,13 @@ def map_backend_error(
 
     # Transient: replica/failover write rejection (also a ResponseError).
     if isinstance(exc, _rexc.ReadOnlyError):
+        return RedisConnectionError(message, operation=operation, name=name, original=exc)
+
+    # Transient: a blocked command (BLPOP/BLMOVE/XREADGROUP ...) interrupted
+    # server-side via CLIENT UNBLOCK - Redis does this to blocked clients
+    # during failovers. Retrying the wait is the right response, so this
+    # ResponseError must not fall through to the permanent branch below.
+    if isinstance(exc, _rexc.ResponseError) and message.startswith("UNBLOCKED"):
         return RedisConnectionError(message, operation=operation, name=name, original=exc)
 
     # Transient: connectivity. BusyLoadingError subclasses ConnectionError.
