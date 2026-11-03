@@ -33,6 +33,8 @@ Distributed semaphore and mutex on Redis with Sentinel support, a sync/async API
 
 - **Counting Semaphore** — limit concurrent access to a resource to at most N
 - **Mutex** — exclusive lock (binary semaphore)
+- **Rate Limiter** — sliding-window limits with weighted costs (e.g. RPM + TPM)
+- **Shared dispatch queue** — FIFO job queues shared by many pods, one leader per queue, failover
 - **Redis Sentinel** — failover support for high availability
 - **Sync and Async APIs** — works with both threading and asyncio
 - **Heartbeat** — automatically extends the lock TTL
@@ -90,6 +92,150 @@ with Semaphore(client, config) as sem:
     # Work with the database
     pass
 ```
+
+### Rate limiter (RPM / TPM)
+
+A semaphore bounds *concurrency*; `RateLimiter` bounds *throughput*: "at most
+N units in any sliding window of W seconds". Several limits are checked
+atomically, and a request is admitted only if it fits all of them — e.g. an
+LLM API with both requests-per-minute and tokens-per-minute quotas.
+
+```python
+from redis_semaphore import RateLimit, RateLimiter, RateLimiterConfig
+
+limiter = RateLimiter(client, RateLimiterConfig(
+    name="cert-1",
+    limits=[
+        RateLimit("requests", limit=100, window=60.0),  # RPM
+        RateLimit("tokens", limit=50_000, window=60.0),  # TPM
+    ],
+    acquire_timeout=30.0,
+))
+
+# Reserve the estimated cost; blocks until it fits all limits
+permit = limiter.acquire({"requests": 1, "tokens": 1_500})
+response = call_api()
+# Settle the real cost (keeps the admission time; may overshoot the limit)
+limiter.adjust(permit, {"tokens": response.total_tokens})
+# ...or refund a request that was never sent: limiter.adjust(permit, 0)
+
+# Non-blocking: Redis returns the exact time until the request fits
+permit = limiter.acquire({"tokens": 1_500}, blocking=False)
+if not permit.success:
+    print(f"retry in {permit.retry_after:.2f}s")
+
+print(limiter.status().usage["tokens"].available)
+```
+
+How it works:
+
+- `cost` is an int charged to every limit, or a mapping `{limit_name: units}`;
+  limits missing from the mapping are charged 1 (so `{"tokens": n}` also
+  counts one request). A cost larger than its limit raises `ValueError`.
+- Each limit is a sliding-window log in Redis (`{namespace}:{name}:{limit}:log`
+  plus a running `:total`); acquire/adjust/status are single Lua scripts using
+  the Redis server clock, so all clients share one view and no NTP is needed.
+- A blocking `acquire()` sleeps exactly until the window frees up (plus
+  `wait_jitter`). With `acquire_timeout` it fails fast: if Redis says the
+  request cannot fit before the deadline, `RateLimitTimeoutError` (with
+  `retry_after`) is raised immediately.
+- There is nothing to release — units leave the window on their own; keys
+  carry a TTL of two windows.
+- Admission is not FIFO: a small request may overtake a waiting large one.
+  Keep per-caller ordering in your own queue.
+
+The same instance supports `aacquire()` / `aadjust()` / `astatus()` with an
+async client. See `examples/rate_limited_agents.py` for agents with
+per-agent queues spreading load over several certificates.
+
+### Shared dispatch queue (many pods, FIFO)
+
+`RateLimiter` decides *whether* a request may go now; it does not queue
+requests. When many processes or pods share a quota and requests must get it
+in arrival order, put them into a shared queue: `DispatchQueue` (producers)
+and `DispatchWorker` (consumers) keep one FIFO queue per name in Redis.
+Requires Redis >= 6.2 (the rest of the library only needs >= 3.2).
+
+```python
+from redis_semaphore import DispatchConfig, DispatchQueue, DispatchWorker, Job
+
+config = DispatchConfig(namespace="llm", max_queue_size=10_000)
+
+# Worker side - run in every pod, as many workers as you like
+async def handler(job: Job) -> dict:
+    permit = await limiter.aacquire({"tokens": job.payload["tokens"]})  # FIFO across pods
+    job.admit()                                 # the next job of the queue may start
+    response = await http.post("/v1/chat", json=job.payload)  # concurrent with it
+    await limiter.aadjust(permit, {"tokens": response.json()["usage"]["total_tokens"]})
+    return response.json()
+
+worker = DispatchWorker(async_client, ["cert-1", "cert-2"], handler, config)
+await worker.run()          # until worker.stop() / cancellation
+
+# Producer side - from any pod
+queue = DispatchQueue(async_client, config)
+result = await queue.asubmit("cert-1", {"tokens": 1500, ...}, timeout=60)
+```
+
+How it works:
+
+- Every queue is a Redis Stream. Exactly one worker *leads* a queue at a time
+  (it holds the queue's `Mutex`); workers of all pods compete for queues, so
+  queues spread over them (`max_queues_per_worker` caps it).
+- The leader runs the handler for one job at a time, in stream order, until
+  the handler calls `job.admit()` (or returns). Everything before `admit()` is
+  strictly serialized per queue across all pods - wait for the scarce resource
+  there; everything after it runs concurrently with the following jobs.
+- The submitter gets the handler's return value (JSON), or `JobFailedError`
+  (`error_type`, `data` - raise `JobError(msg, data=...)` for structured
+  details), or `JobTimeoutError`. A job still queued past its `timeout` is
+  dropped instead of run; `job.deadline` / `job.remaining` let the handler
+  give up early. `QueueFullError` above `max_queue_size`.
+- `raise RequeueJob(delay=0)` from the handler puts the job back into its
+  queue instead of failing it (e.g. after an upstream 429): the submitter
+  keeps waiting, and the leader runs the job again before any job not
+  started yet. Wait for the resource again *before* `admit()` on the re-run
+  (`job.reclaimed` is True), so the job holds the head of the queue while it
+  waits. The job's `timeout` still bounds the whole thing.
+- Pod crash: its Mutexes expire after `leader_ttl` and other workers take
+  over. Jobs it had taken stay pending; live workers touch their jobs, so
+  after `reclaim_idle` without that the new leader re-runs them
+  (`job.reclaimed=True`). **Delivery is at-least-once** - use `job.id` as an
+  idempotency key if a repeat is harmful. Reclaimed jobs come back up to
+  `reclaim_idle` later while new jobs keep flowing, so FIFO order holds
+  under a stable leader but **not across a crash failover**.
+- Graceful shutdown (`worker.stop()`, e.g. on SIGTERM): jobs not admitted yet
+  are handed back to the queue at once, admitted ones run to completion.
+- Deadlines use the Redis server clock (stamped inside the enqueue script),
+  like everything else in this library - no NTP sync between pods needed.
+  Each waiting `asubmit()` holds one Redis connection (BLMOVE) - size the
+  pool for the expected number of concurrent submissions.
+
+#### Health checks
+
+Two views, for different questions:
+
+```python
+# Global state of a queue - the same from every pod (one Lua call + a leader check)
+status = await queue.astatus("cert-1")
+# QueueStatus(name='cert-1', length=12, in_progress=3, waiting=9,
+#             oldest_age=4.2, has_leader=True)
+statuses = await queue.astatus_many(["cert-1", "cert-2"])   # dict by name
+
+# Local health of a worker in this pod - no Redis round-trip
+health = worker.health()
+# WorkerHealth(worker_id=..., running=True, stopping=False, leading=('cert-1',),
+#              jobs_in_progress=1, last_loop_age=0.4, last_error=None,
+#              last_error_age=None, healthy=True)
+```
+
+- Alarm on `has_leader=False` with a non-empty queue (nobody serves it) or a
+  steadily growing `oldest_age` (the queue is stuck or starved).
+- `health.healthy` = running, not stopping, main loop not stalled and no Redis
+  error within `5 x election_interval`: suits a Kubernetes **readiness**
+  probe. For a **liveness** probe check only `running` and `last_loop_age` -
+  restarting pods does not fix a Redis outage.
+- Both are dataclasses: `dataclasses.asdict()` gives JSON-ready dicts.
 
 ### Async API
 
@@ -194,8 +340,28 @@ during failover, you need a different mechanism (e.g. a consensus store).
   report generation, background jobs that must not run in parallel).
 - **Semaphore** — when bounded concurrency is acceptable: "no more than N"
   (connection pools, rate limiting external services, load throttling).
+- **RateLimiter** — when the quota is per time window rather than per
+  concurrent holder: "no more than N per minute" (API requests/tokens per
+  minute). Combine with a Semaphore if both kinds of limit apply.
 
 ## Configuration and usage
+
+### Names and keys
+
+Names of semaphores, mutexes, rate limiters and dispatch queues are opaque
+strings: any non-empty string works - one word, `agent:division:model`,
+`a:b:c:d`, spaces, unicode. The library never splits them; it only adds the
+namespace in front and a fixed suffix behind (`<namespace>:<name>:owners`,
+`<namespace>:<queue>:stream`, ...), so different names never share keys.
+
+The one exception is the name of a `RateLimit` inside a limiter
+(`"requests"`, `"tokens"`): it must not contain `:`, because it is appended
+after the free-form limiter name (`<namespace>:<limiter>:<limit>:log`).
+
+Use different namespaces for different kinds of primitives (the defaults -
+`semaphore`, `mutex`, `ratelimit`, `dispatch` - already differ): a `Mutex` is
+a `Semaphore` with `limit=1`, so the same name in the same namespace is the
+same lock.
 
 ### SemaphoreConfig
 
@@ -490,14 +656,16 @@ set_metrics(PrometheusMetrics(registry=REGISTRY))
 
 ## Examples
 
-See `examples/basic_usage.py` (sync/async examples) and
-`examples/multiprocess_simulation.py` (a simulation of several processes).
+See `examples/basic_usage.py` (sync/async examples),
+`examples/multiprocess_simulation.py` (a simulation of several processes) and
+`examples/rate_limited_agents.py` (agents sharing RPM/TPM quotas per certificate).
 
 Run them with:
 
 ```bash
 python examples/basic_usage.py
 python examples/multiprocess_simulation.py
+python examples/rate_limited_agents.py
 ```
 
 ## More about how the semaphore works

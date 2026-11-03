@@ -29,3 +29,13 @@ async def async_redis_client():
     yield client
     await client.flushdb()
     await client.aclose()
+
+
+@pytest.fixture
+async def async_resp3_client():
+    """Async client speaking RESP3 (protocol=3): reply shapes differ from RESP2."""
+    client = aioredis.Redis(host="localhost", port=_redis_port(), db=15, protocol=3)
+    await client.flushdb()
+    yield client
+    await client.flushdb()
+    await client.aclose()

@@ -38,6 +38,7 @@ class _FakeClient:
         rexc.ConnectionError("refused"),
         rexc.TimeoutError("timed out"),
         rexc.ReadOnlyError("read only replica"),
+        rexc.ResponseError("UNBLOCKED client unblocked via CLIENT UNBLOCK"),
         OSError("socket boom"),
     ],
 )

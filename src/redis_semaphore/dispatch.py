@@ -1,0 +1,1168 @@
+"""Shared FIFO job queues for many processes/pods, with one leader per queue.
+
+    any process: DispatchQueue.asubmit() --XADD--> queue stream
+                                                     |
+                 leader of the queue (DispatchWorker) <--+
+                   handler(job): wait for a resource -> job.admit() -> work
+                                                     |
+    submitter <--------------- BLPOP reply <---------+
+
+- Every queue is a Redis Stream; submitting appends a job and waits for its
+  result on a per-job reply list.
+- Every queue has exactly one leader at a time: the worker holding the
+  queue's Mutex. Workers of all processes compete for the queues, so queues
+  spread over the workers.
+- The leader runs the handler for one job at a time, in stream order, until
+  the handler calls ``job.admit()`` (or returns). The rest of the handler runs
+  concurrently with the following jobs. Waiting for a scarce resource (e.g. a
+  RateLimiter permit) before ``admit()`` therefore grants that resource in
+  FIFO order across all processes while the queue's leader is stable, and the
+  slow part (the request itself) runs in parallel. After a worker crash the
+  jobs it had taken return via reclaim (up to reclaim_idle later) while new
+  jobs keep flowing, so ordering is not guaranteed across a failover.
+- If a worker dies, its Mutexes expire after leader_ttl and other workers take
+  over its queues. Jobs it had taken but not answered stay in the stream's
+  pending list; a live worker touches its jobs, so after reclaim_idle without
+  that the queue's leader reclaims and re-runs them (delivery is
+  at-least-once; ``job.reclaimed`` tells the handler).
+- Timestamps and deadlines come from the Redis server clock (stamped inside
+  the enqueue script), like the rest of the library: no NTP sync needed.
+- Requires Redis >= 6.2 (XAUTOCLAIM, BLMOVE); RESP2 and RESP3 clients work.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import random
+import socket
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any
+
+import redis
+import redis.asyncio as aioredis
+
+from .errors import (
+    BackendError,
+    CommandDeniedError,
+    JobError,
+    JobFailedError,
+    JobTimeoutError,
+    MixedModeError,
+    QueueFullError,
+    RateLimitTimeoutError,
+    RequeueJob,
+    backend_errors,
+    map_backend_error,
+)
+from .logger import logger
+from .lua_scripts import LuaScriptRegistry, LuaScriptRunner, ScriptClientAdapter
+from .metrics import get_metrics
+from .semaphore import _BLPOP_SOCKET_TIMEOUT_FRACTION, Mutex, _client_socket_timeout
+from .types import DispatchConfig, QueueStatus, WorkerHealth
+
+# Longest single BLPOP / XREADGROUP wait; also bounded by the socket timeout.
+_MAX_BLOCK = 5.0
+_MIN_BLOCK = 0.01
+# How often a leader re-checks its Mutex while a handler waits for admission.
+_LEADERSHIP_CHECK = 1.0
+# A submitter rides out transient errors while waiting for its reply for this
+# long (e.g. a Sentinel failover), pausing between attempts.
+_WAIT_ERROR_BUDGET = 10.0
+_WAIT_ERROR_PAUSE = 0.5
+
+
+class Job:
+    """A job taken from a queue, passed to the handler.
+
+    Attributes:
+        queue: Queue name.
+        id: Unique job id (stable across re-runs; use it for idempotency).
+        payload: The JSON payload given to submit().
+        created: Epoch seconds when the job was submitted (Redis server
+            clock, stamped inside the enqueue script - no NTP sync needed).
+        deadline: Epoch seconds (server clock) after which the submitter
+            stops waiting, or None. A handler waiting for a resource should
+            give up past it; compare via :attr:`remaining`, not time.time().
+        reclaimed: True if the job runs again: after the handler raised
+            RequeueJob, or taken over from a worker presumed dead (then it
+            may have run partly or fully before).
+    """
+
+    __slots__ = (
+        "_admitted",
+        "_clock_offset",
+        "_settled",
+        "created",
+        "deadline",
+        "entry_id",
+        "id",
+        "payload",
+        "queue",
+        "reclaimed",
+    )
+
+    def __init__(
+        self,
+        queue: str,
+        entry_id: str,
+        id: str,
+        payload: Any,
+        created: float,
+        deadline: float | None,
+        reclaimed: bool = False,
+        clock_offset: float = 0.0,
+    ) -> None:
+        self.queue = queue
+        self.entry_id = entry_id
+        self.id = id
+        self.payload = payload
+        self.created = created
+        self.deadline = deadline
+        self.reclaimed = reclaimed
+        # Server minus local clock, measured by the worker: deadlines are
+        # server-clock epochs, the local clock alone may be skewed.
+        self._clock_offset = clock_offset
+        self._admitted = False
+        # Set on admit() or when the handler finishes: the queue may move on.
+        self._settled = asyncio.Event()
+
+    def admit(self) -> None:
+        """Let the queue move on: the next job starts while this one continues."""
+        self._admitted = True
+        self._settled.set()
+
+    @property
+    def admitted(self) -> bool:
+        return self._admitted
+
+    @property
+    def remaining(self) -> float | None:
+        """Seconds until the deadline (may be negative), or None without one.
+
+        Estimated against the Redis server clock (the worker measures the
+        local-to-server offset periodically), so it is meaningful even when
+        this machine's wall clock is skewed.
+        """
+        if self.deadline is None:
+            return None
+        return self.deadline - (time.time() + self._clock_offset)
+
+    def __repr__(self) -> str:
+        return f"Job(queue={self.queue!r}, id={self.id!r}, admitted={self._admitted})"
+
+
+JobHandler = Callable[[Job], Awaitable[Any]]
+
+
+class _Keys:
+    """Redis key layout shared by producers and workers."""
+
+    def __init__(self, config: DispatchConfig) -> None:
+        self._config = config
+
+    def _prefix(self, queue: str) -> str:
+        prefix = f"{self._config.namespace}:{queue}"
+        if self._config.cluster_hash_tags:
+            return "{" + prefix + "}"
+        return prefix
+
+    def stream(self, queue: str) -> str:
+        return f"{self._prefix(queue)}:stream"
+
+    def reply(self, queue: str, job_id: str) -> str:
+        return f"{self._prefix(queue)}:reply:{job_id}"
+
+    def submit_marker(self, queue: str, job_id: str) -> str:
+        """Dedup marker of one submit (same hash slot as the stream)."""
+        return f"{self._prefix(queue)}:submit:{job_id}"
+
+    @staticmethod
+    def leader_name(queue: str) -> str:
+        """Name of the queue's leadership Mutex (in the same namespace)."""
+        return f"{queue}:leader"
+
+    def leader_owners(self, queue: str) -> str:
+        """The leadership Mutex's owners key (same layout as Semaphore.owners_key)."""
+        prefix = f"{self._config.namespace}:{self.leader_name(queue)}"
+        if self._config.cluster_hash_tags:
+            prefix = "{" + prefix + "}"
+        return f"{prefix}:owners"
+
+
+def _block_cap(client: object) -> float:
+    """Longest safe single blocking wait for this client."""
+    socket_timeout = _client_socket_timeout(client)
+    if socket_timeout is None or socket_timeout <= 0:
+        return _MAX_BLOCK
+    return min(_MAX_BLOCK, socket_timeout * _BLPOP_SOCKET_TIMEOUT_FRACTION)
+
+
+def _tolerate_wait_error(exc: Exception, queue: str, failing_since: float | None) -> float:
+    """Ride out a transient error while waiting for a reply (the job is queued).
+
+    Surfacing a blip would lose the result of a job that still runs. Returns
+    the start of the current failure streak; raises the mapped BackendError if
+    the error is permanent or the streak exceeds _WAIT_ERROR_BUDGET.
+    """
+    mapped = map_backend_error(exc, operation="dispatch_wait", name=queue)
+    now = time.monotonic()
+    if failing_since is None:
+        failing_since = now
+    if not mapped.is_transient or now - failing_since >= _WAIT_ERROR_BUDGET:
+        raise mapped from exc
+    logger.warning("Waiting for a reply in queue '%s' failed, retrying: %s", queue, exc)
+    return failing_since
+
+
+def _wait_error_pause(give_up: float | None) -> float:
+    if give_up is None:
+        return _WAIT_ERROR_PAUSE
+    return max(0.0, min(_WAIT_ERROR_PAUSE, give_up - time.monotonic()))
+
+
+def _check_queue_name(queue: str) -> None:
+    if not queue:
+        raise ValueError("queue name must not be empty")
+
+
+def _record_job(queue: str, namespace: str, result: str) -> None:
+    """Count a job outcome (completed/failed/requeued/reclaimed/expired)."""
+    metrics = get_metrics()
+    if not metrics.enabled:
+        return
+    inc = getattr(metrics, "inc_dispatch_job", None)
+    if inc is not None:  # custom collectors may predate this hook
+        inc(queue, namespace, result)
+
+
+def _parse_reply(raw: bytes | str) -> Any:
+    data = json.loads(raw)
+    if data.get("ok"):
+        return data.get("result")
+    raise JobFailedError(data.get("error_type", "Error"), data.get("message", ""), data.get("data"))
+
+
+# =============================================================================
+# Producer side
+# =============================================================================
+
+
+class DispatchQueue:
+    """Submits jobs to shared queues and waits for their results.
+
+    Usage:
+        queue = DispatchQueue(redis_client)
+        result = await queue.asubmit("cert-1", {"prompt": "hi"}, timeout=60)
+
+    Works with a sync client (submit) or an async client (asubmit).
+    """
+
+    __slots__ = ("_block_cap", "_client", "_config", "_keys", "_runner", "_script_client")
+
+    def __init__(
+        self, client: redis.Redis | aioredis.Redis, config: DispatchConfig | None = None
+    ) -> None:
+        self._client = client
+        self._config = config or DispatchConfig()
+        self._keys = _Keys(self._config)
+        self._runner = LuaScriptRunner(LuaScriptRegistry())
+        self._script_client = ScriptClientAdapter(client)
+        self._block_cap = _block_cap(client)
+
+    @property
+    def config(self) -> DispatchConfig:
+        return self._config
+
+    def stream_key(self, queue: str) -> str:
+        """Redis key of the queue's stream."""
+        return self._keys.stream(queue)
+
+    def _require_sync(self) -> None:
+        if isinstance(self._client, aioredis.Redis):
+            raise MixedModeError("This method needs a sync Redis client; use the a*() variant")
+
+    def _require_async(self) -> None:
+        if not isinstance(self._client, aioredis.Redis):
+            raise MixedModeError("This method needs a redis.asyncio client; use the sync variant")
+
+    def _check_args(self, queue: str, timeout: float | None) -> None:
+        _check_queue_name(queue)
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be > 0 or None")
+
+    def _full(self, queue: str) -> QueueFullError:
+        return QueueFullError(f"Queue '{queue}' is full ({self._config.max_queue_size} jobs)")
+
+    def _timed_out(self, queue: str, job_id: str, timeout: float | None) -> JobTimeoutError:
+        return JobTimeoutError(f"No result for job {job_id} in queue '{queue}' within {timeout}s")
+
+    async def asubmit(
+        self, queue: str, payload: Any = None, *, timeout: float | None = None
+    ) -> Any:
+        """Put a job into the queue and wait for the handler's result.
+
+        Args:
+            queue: Queue name.
+            payload: JSON-serializable job data.
+            timeout: Max seconds to wait for the result (None = forever).
+                Also the job's deadline: a job still queued past it is
+                dropped instead of run.
+
+        Returns:
+            Whatever the handler returned (after a JSON round-trip).
+
+        Raises:
+            QueueFullError: The queue holds max_queue_size jobs.
+            JobTimeoutError: No result within timeout.
+            JobFailedError: The handler raised.
+            BackendError: On Redis failure.
+        """
+        self._require_async()
+        self._check_args(queue, timeout)
+        job_id = uuid.uuid4().hex
+        with backend_errors("dispatch_submit", queue):
+            entry_id = await self._runner.dispatch_enqueue_async(
+                self._script_client,
+                self._keys.stream(queue),
+                self._keys.submit_marker(queue, job_id),
+                self._config.max_queue_size or 0,
+                int(self._config.reply_ttl * 1000),
+                job_id,
+                json.dumps(payload),
+                "" if timeout is None else int(timeout * 1000),
+            )
+            if entry_id is None:
+                raise self._full(queue)
+
+            give_up = None if timeout is None else time.monotonic() + timeout
+            reply_key = self._keys.reply(queue, job_id)
+            failing_since: float | None = None
+            while True:
+                block = self._block_cap
+                if give_up is not None:
+                    block = min(block, give_up - time.monotonic())
+                    if block <= 0:
+                        raise self._timed_out(queue, job_id, timeout)
+                    # Very small timeouts are truncated to 0 (= block forever)
+                    # by Redis before 7.0; keep a sane floor.
+                    block = max(block, _MIN_BLOCK)
+                try:
+                    # BLMOVE back onto the same list reads without consuming:
+                    # a reply lost in flight is still there for the retry.
+                    reply = await self._client.blmove(
+                        reply_key,
+                        reply_key,
+                        timeout=block,  # type: ignore[arg-type]  # floats are fine
+                        src="RIGHT",
+                        dest="LEFT",
+                    )
+                except (redis.RedisError, OSError) as exc:
+                    failing_since = _tolerate_wait_error(exc, queue, failing_since)
+                    await asyncio.sleep(_wait_error_pause(give_up))
+                    continue
+                failing_since = None
+                if reply is not None:
+                    with contextlib.suppress(redis.RedisError, OSError):
+                        await self._client.delete(reply_key)
+                    return _parse_reply(reply)
+
+    def submit(self, queue: str, payload: Any = None, *, timeout: float | None = None) -> Any:
+        """Sync version of :meth:`asubmit` (needs a sync client)."""
+        self._require_sync()
+        self._check_args(queue, timeout)
+        job_id = uuid.uuid4().hex
+        with backend_errors("dispatch_submit", queue):
+            entry_id = self._runner.dispatch_enqueue(
+                self._script_client,
+                self._keys.stream(queue),
+                self._keys.submit_marker(queue, job_id),
+                self._config.max_queue_size or 0,
+                int(self._config.reply_ttl * 1000),
+                job_id,
+                json.dumps(payload),
+                "" if timeout is None else int(timeout * 1000),
+            )
+            if entry_id is None:
+                raise self._full(queue)
+
+            give_up = None if timeout is None else time.monotonic() + timeout
+            reply_key = self._keys.reply(queue, job_id)
+            failing_since: float | None = None
+            while True:
+                block = self._block_cap
+                if give_up is not None:
+                    block = min(block, give_up - time.monotonic())
+                    if block <= 0:
+                        raise self._timed_out(queue, job_id, timeout)
+                    # Very small timeouts are truncated to 0 (= block forever)
+                    # by Redis before 7.0; keep a sane floor.
+                    block = max(block, _MIN_BLOCK)
+                try:
+                    # BLMOVE back onto the same list reads without consuming:
+                    # a reply lost in flight is still there for the retry.
+                    reply = self._client.blmove(
+                        reply_key,
+                        reply_key,
+                        timeout=block,  # type: ignore[arg-type]  # floats are fine
+                        src="RIGHT",
+                        dest="LEFT",
+                    )
+                except (redis.RedisError, OSError) as exc:
+                    failing_since = _tolerate_wait_error(exc, queue, failing_since)
+                    time.sleep(_wait_error_pause(give_up))
+                    continue
+                failing_since = None
+                if reply is not None:
+                    with contextlib.suppress(redis.RedisError, OSError):
+                        self._client.delete(reply_key)
+                    return _parse_reply(reply)  # type: ignore[arg-type]
+
+    async def astatus(self, queue: str) -> QueueStatus:
+        """Current state of a queue, e.g. for a health check or dashboard.
+
+        Works from any process; reflects all producers and workers.
+
+        Raises:
+            BackendError: On Redis failure.
+        """
+        self._require_async()
+        _check_queue_name(queue)
+        with backend_errors("dispatch_status", queue):
+            (length, in_progress, oldest_ms), (leaders, _, _) = await asyncio.gather(
+                self._runner.dispatch_status_async(
+                    self._script_client, self._keys.stream(queue), self._config.group
+                ),
+                self._runner.status_async(
+                    self._script_client, self._keys.leader_owners(queue), "", None
+                ),
+            )
+        return self._build_status(queue, length, in_progress, oldest_ms, leaders)
+
+    async def astatus_many(self, queues: Iterable[str]) -> dict[str, QueueStatus]:
+        """:meth:`astatus` of several queues, queried concurrently."""
+        names = list(dict.fromkeys(queues))
+        statuses = await asyncio.gather(*(self.astatus(queue) for queue in names))
+        return dict(zip(names, statuses, strict=True))
+
+    def status(self, queue: str) -> QueueStatus:
+        """Sync version of :meth:`astatus` (needs a sync client)."""
+        self._require_sync()
+        _check_queue_name(queue)
+        with backend_errors("dispatch_status", queue):
+            length, in_progress, oldest_ms = self._runner.dispatch_status(
+                self._script_client, self._keys.stream(queue), self._config.group
+            )
+            leaders, _, _ = self._runner.status(
+                self._script_client, self._keys.leader_owners(queue), "", None
+            )
+        return self._build_status(queue, length, in_progress, oldest_ms, leaders)
+
+    def status_many(self, queues: Iterable[str]) -> dict[str, QueueStatus]:
+        """Sync version of :meth:`astatus_many` (queries one by one)."""
+        return {queue: self.status(queue) for queue in dict.fromkeys(queues)}
+
+    @staticmethod
+    def _build_status(
+        queue: str, length: int, in_progress: int, oldest_ms: int, leaders: int
+    ) -> QueueStatus:
+        return QueueStatus(
+            name=queue,
+            length=length,
+            in_progress=in_progress,
+            waiting=max(0, length - in_progress),
+            oldest_age=oldest_ms / 1000 if oldest_ms >= 0 else None,
+            has_leader=leaders > 0,
+        )
+
+    async def alength(self, queue: str) -> int:
+        """Jobs in the queue (waiting + in progress)."""
+        self._require_async()
+        with backend_errors("dispatch_length", queue):
+            return int(await self._client.xlen(self._keys.stream(queue)))
+
+    def length(self, queue: str) -> int:
+        """Sync version of :meth:`alength` (needs a sync client)."""
+        self._require_sync()
+        with backend_errors("dispatch_length", queue):
+            return int(self._client.xlen(self._keys.stream(queue)))  # type: ignore[arg-type]
+
+
+# =============================================================================
+# Worker side
+# =============================================================================
+
+
+def default_worker_id() -> str:
+    """hostname (the pod name in Kubernetes) + pid + random suffix."""
+    return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _text(value: bytes | str) -> str:
+    return value.decode() if isinstance(value, bytes) else value
+
+
+class DispatchWorker:
+    """Competes for queue leadership and runs the handler for the queues it leads.
+
+    Usage:
+        async def handler(job: Job) -> dict:
+            permit = await limiter.aacquire(...)   # in FIFO order across all pods
+            job.admit()                            # the next job may start now
+            response = await http.post(...)        # concurrent with next jobs
+            return {"status": response.status_code}
+
+        worker = DispatchWorker(async_redis, ["cert-1", "cert-2"], handler)
+        await worker.run()      # until stop() or cancellation
+
+    Run as many workers per process and as many processes as needed; each
+    queue is led by exactly one of them at a time. Requires an async client.
+    """
+
+    def __init__(
+        self,
+        client: aioredis.Redis,
+        queues: Iterable[str],
+        handler: JobHandler,
+        config: DispatchConfig | None = None,
+        *,
+        worker_id: str | None = None,
+    ) -> None:
+        if not isinstance(client, aioredis.Redis):
+            raise TypeError("DispatchWorker requires a redis.asyncio client")
+        self._queues = list(dict.fromkeys(queues))
+        if not self._queues:
+            raise ValueError("queues must not be empty")
+        for queue in self._queues:
+            _check_queue_name(queue)
+        self.id = worker_id or default_worker_id()
+        self._client = client
+        self._handler = handler
+        self._config = config or DispatchConfig()
+        self._keys = _Keys(self._config)
+        self._block_cap = _block_cap(client)
+        interval = self._config.election_interval
+        # Same None-default pattern as SemaphoreConfig.refresh_interval.
+        self._election_interval = interval if interval is not None else self._config.leader_ttl / 3
+        self._stopping = asyncio.Event()
+        self._running = False
+        # Orders touch-loop XCLAIMs against _hand_back's: a touch landing after
+        # the hand-back would reset the idle time it set and hide the entry
+        # from reclaim for another reclaim_idle.
+        self._claim_lock = asyncio.Lock()
+        # Health: last main loop tick and last Redis error (monotonic time).
+        self._last_loop: float | None = None
+        self._last_error: tuple[float, str] | None = None
+        # A permanent backend error (ACL, unsupported command): re-electing
+        # would fail the same way forever, so run() stops and raises it.
+        self._fatal: BackendError | None = None
+        # Server minus local clock, refreshed on every reclaim tick: created/
+        # deadline are server-clock epochs, local wall clocks may be skewed.
+        self._clock_offset = 0.0
+        self._leading: dict[str, asyncio.Task[None]] = {}
+        self._handlers: set[asyncio.Task[None]] = set()
+        # Handlers per stream, for the max_admitted cap.
+        self._stream_handlers: dict[str, set[asyncio.Task[None]]] = {}
+        # Throttles the consumer pruning (XINFO CONSUMERS) per stream.
+        self._next_prune: dict[str, float] = {}
+        # stream -> entry ids taken by this worker and not answered yet
+        self._taken: dict[str, set[str]] = {}
+        # streams with a job just requeued: scan for it before reading new jobs
+        self._reclaim_now: set[str] = set()
+        # (stream, entry id) -> when this worker requeued it; such entries are
+        # expected in the next reclaim and are not reported as abandoned
+        self._requeued: dict[tuple[str, str], float] = {}
+
+    @property
+    def leading(self) -> list[str]:
+        """Queues this worker currently leads."""
+        return [queue for queue, task in self._leading.items() if not task.done()]
+
+    def health(self) -> WorkerHealth:
+        """Local health snapshot of this worker (no Redis round-trip).
+
+        Cheap enough for every probe request; combine with
+        :meth:`DispatchQueue.astatus` for the queues' global state.
+        """
+        now = time.monotonic()
+        stall_limit = 5 * self._election_interval
+        loop_age = None if self._last_loop is None else now - self._last_loop
+        error_age = None if self._last_error is None else now - self._last_error[0]
+        healthy = (
+            self._running
+            and not self._stopping.is_set()
+            and loop_age is not None
+            and loop_age < stall_limit
+            and (error_age is None or error_age >= stall_limit)
+        )
+        return WorkerHealth(
+            worker_id=self.id,
+            running=self._running,
+            stopping=self._running and self._stopping.is_set(),
+            leading=tuple(self.leading),
+            jobs_in_progress=len(self._handlers),
+            last_loop_age=loop_age,
+            last_error=None if self._last_error is None else self._last_error[1],
+            last_error_age=error_age,
+            healthy=healthy,
+        )
+
+    def _record_error(self, exc: BaseException) -> None:
+        self._last_error = (time.monotonic(), f"{type(exc).__name__}: {exc}")
+
+    def stop(self) -> None:
+        """Ask run() to finish: stop taking jobs, let admitted jobs complete."""
+        self._stopping.set()
+
+    async def run(self) -> None:
+        """Lead queues until stop() or cancellation, then shut down gracefully.
+
+        On shutdown jobs not admitted yet are handed back (their handlers are
+        cancelled and the next leader picks them up at once); admitted jobs
+        run to completion.
+
+        Raises:
+            PermanentBackendError: Leading failed in a way a re-election would
+                repeat forever (ACL denial, Redis < 6.2 without XAUTOCLAIM).
+        """
+        if self._running:
+            raise RuntimeError("DispatchWorker.run() is already running")
+        self._running = True
+        # _stopping is cleared on exit (not here), so a stop() issued before
+        # run() starts is honoured.
+        touch = asyncio.create_task(self._touch_loop())
+        try:
+            while not self._stopping.is_set():
+                self._last_loop = time.monotonic()
+                if await self._elect():
+                    # Took a queue: grab the next free one almost at once, so
+                    # covering many queues does not take Q * election_interval.
+                    pause = self._election_interval * random.uniform(0.0, 0.1)
+                else:
+                    pause = self._election_interval * random.uniform(0.5, 1.5)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stopping.wait(), timeout=pause)
+        finally:
+            self._stopping.set()
+            await self._shutdown(touch)
+        if self._fatal is not None:
+            fatal, self._fatal = self._fatal, None
+            raise fatal
+
+    async def _shutdown(self, touch: asyncio.Task[None]) -> None:
+        """Finish the cleanup even if cancelled again meanwhile.
+
+        A second cancellation (``asyncio.wait_for(task, grace)`` issues exactly
+        that) must not abort the cleanup halfway: that would leak running
+        handlers, keep the consumer registered and hold leadership until its
+        TTL. Instead it hardens the shutdown - handlers are cancelled - and
+        the rest of the cleanup still runs; the cancellation is re-raised once
+        the worker is back in a clean state.
+        """
+        steps = asyncio.ensure_future(self._shutdown_steps(touch))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(steps)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if steps.done():
+                    break
+                for task in self._handlers:
+                    task.cancel()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _shutdown_steps(self, touch: asyncio.Task[None]) -> None:
+        await asyncio.gather(*self._leading.values(), return_exceptions=True)
+        await asyncio.gather(*self._handlers, return_exceptions=True)
+        touch.cancel()
+        await asyncio.gather(touch, return_exceptions=True)
+        self._leading.clear()
+        # Clear per-run state: stale _taken ids surviving into the next run()
+        # would make the touch loop re-claim entries this worker no longer
+        # handles (idle 0 forever = nobody could ever reclaim them).
+        self._taken.clear()
+        self._stream_handlers.clear()
+        self._requeued.clear()
+        self._reclaim_now.clear()
+        self._next_prune.clear()
+        self._stopping.clear()
+        self._running = False
+        self._last_loop = None
+
+    @staticmethod
+    def _is_fatal(error: BackendError) -> bool:
+        """Only errors every future leader would hit again stop the worker:
+        an ACL denial or a missing command (Redis < 6.2). Everything else -
+        OOM, MASTERDOWN mid-failover, BUSY scripts, a deleted stream
+        (NOGROUP), connection trouble - is recoverable: drop leadership, log
+        and re-elect, as a one-off server hiccup must not take down every
+        worker of the fleet at once.
+        """
+        if isinstance(error.original, redis.exceptions.NoPermissionError):
+            return True
+        return "unknown command" in str(error).lower()
+
+    def _stop_fatally(self, error: BackendError, queue: str) -> None:
+        """A permanent error would repeat on every election: stop, don't thrash."""
+        logger.error(
+            "Worker %s: queue '%s' failed permanently, stopping: %s", self.id, queue, error
+        )
+        if self._fatal is None:
+            self._fatal = error
+        self._stopping.set()
+
+    async def _elect(self) -> bool:
+        """Try to take one more free queue; True if one was taken.
+
+        One queue per call spreads queues over workers; the caller skips the
+        election pause after a success, so startup coverage of many queues
+        does not depend on election_interval.
+        """
+        self._leading = {q: t for q, t in self._leading.items() if not t.done()}
+        cap = self._config.max_queues_per_worker
+        if cap is not None and len(self._leading) >= cap:
+            return False
+        free = [queue for queue in self._queues if queue not in self._leading]
+        random.shuffle(free)
+        for queue in free:
+            mutex = Mutex(
+                self._client,
+                self._keys.leader_name(queue),
+                namespace=self._config.namespace,
+                lock_timeout=self._config.leader_ttl,
+                cluster_hash_tags=self._config.cluster_hash_tags,
+            )
+            try:
+                acquired = (await mutex.aacquire(blocking=False)).success
+            except Exception as exc:
+                self._record_error(exc)
+                if isinstance(exc, BackendError) and self._is_fatal(exc):
+                    self._stop_fatally(exc, queue)
+                else:
+                    logger.warning(
+                        "Worker %s: election for '%s' failed", self.id, queue, exc_info=True
+                    )
+                return False
+            self._last_error = None  # Redis answered
+            if acquired:
+                logger.info("Worker %s leads queue '%s'", self.id, queue)
+                self._leading[queue] = asyncio.create_task(self._lead(queue, mutex))
+                return True
+        return False
+
+    # -- leading a queue ------------------------------------------------------
+
+    async def _lead(self, queue: str, mutex: Mutex) -> None:
+        stream = self._keys.stream(queue)
+        next_reclaim = 0.0
+        reclaim_cursor = "0-0"
+        try:
+            await self._ensure_group(stream)
+            while mutex.is_acquired and not self._stopping.is_set():
+                entries: list[tuple[Any, Any]] = []
+                reclaimed = False
+                forced = stream in self._reclaim_now
+                if forced or time.monotonic() >= next_reclaim:
+                    # Requeued jobs and jobs of dead workers go before unread ones.
+                    self._reclaim_now.discard(stream)
+                    if forced:
+                        reclaim_cursor = "0-0"
+                    entries, reclaim_cursor = await self._reclaim(queue, stream, reclaim_cursor)
+                    if not entries:
+                        # Deliveries this consumer never saw (the client resent
+                        # XREADGROUP after a lost reply) sit in its own PEL:
+                        # pick them up now instead of waiting out reclaim_idle.
+                        entries = await self._backlog(stream)
+                    reclaimed = bool(entries)
+                    if reclaim_cursor == "0-0":
+                        # Whole pending list scanned; otherwise continue at once.
+                        next_reclaim = time.monotonic() + self._config.reclaim_interval
+                if not entries:
+                    entries = await self._read(stream)
+                # Touch the whole batch from now on: a job waiting behind slow
+                # admissions must not look abandoned and be reclaimed twice.
+                taken = self._taken.setdefault(stream, set())
+                taken.update(_text(e[0]) for e in entries if e[0] is not None)
+                done = 0
+                try:
+                    for entry_id, fields in entries:
+                        done += 1
+                        if not await self._dispatch(
+                            queue, stream, entry_id, fields, reclaimed, mutex
+                        ):
+                            # Lost leadership / stopping: hand back the rest at once.
+                            await self._hand_back(stream, [e[0] for e in entries[done:]])
+                            return
+                finally:
+                    # Entries never dispatched (e.g. an error mid-batch) must
+                    # not be touched forever: leave them reclaimable.
+                    for entry_id, _ in entries[done:]:
+                        if entry_id is not None:
+                            taken.discard(_text(entry_id))
+        except (redis.RedisError, OSError, BackendError) as exc:
+            self._record_error(exc)
+            mapped = (
+                exc
+                if isinstance(exc, BackendError)
+                else map_backend_error(exc, operation="dispatch_lead", name=queue)
+            )
+            if self._is_fatal(mapped):
+                self._stop_fatally(mapped, queue)
+            else:
+                logger.warning("Worker %s: leading '%s' failed", self.id, queue, exc_info=True)
+        finally:
+            if mutex.is_acquired:
+                try:
+                    await mutex.arelease()
+                except Exception:
+                    logger.debug("Worker %s: release of '%s' failed", self.id, queue, exc_info=True)
+            logger.info("Worker %s stopped leading queue '%s'", self.id, queue)
+
+    async def _ensure_group(self, stream: str) -> None:
+        try:
+            await self._client.xgroup_create(stream, self._config.group, id="0", mkstream=True)
+        except redis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    async def _read(self, stream: str) -> list[tuple[Any, Any]]:
+        block_ms = int(min(self._config.read_timeout, self._block_cap) * 1000)
+        try:
+            response = await self._client.xreadgroup(
+                self._config.group, self.id, {stream: ">"}, count=1, block=max(1, block_ms)
+            )
+        except redis.ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            await self._ensure_group(stream)  # the stream was deleted meanwhile
+            return []
+        return self._entries(response)
+
+    @staticmethod
+    def _entries(response: Any) -> list[tuple[Any, Any]]:
+        """Entries of an XREADGROUP reply: RESP2 is a list of (stream, entries)
+        pairs, RESP3 (protocol=3) a dict of entry batches per stream."""
+        if not response:
+            return []
+        if isinstance(response, dict):
+            return [entry for batch in next(iter(response.values())) for entry in batch]
+        return list(response[0][1])
+
+    async def _backlog(self, stream: str) -> list[tuple[Any, Any]]:
+        """Own pending entries nobody is working on.
+
+        A delivery whose reply was lost (e.g. redis-py resent XREADGROUP after
+        a timeout) lands in this consumer's PEL unseen; without this check it
+        would run only after reclaim_idle, via self-reclaim, out of order.
+        Entries in _taken are being handled right now and stay out. Treated as
+        reclaimed: the entry may also come from a _finish() that failed after
+        the handler ran, so a re-run must be flagged.
+        """
+        # Snapshot BEFORE the read: a job finishing (XACK+XDEL, then discard)
+        # while the reply is in flight must still be filtered out - its
+        # delivery in this reply predates the finish. The count leaves room
+        # for a lost delivery behind every currently-taken entry.
+        taken = set(self._taken.get(stream, ()))
+        try:
+            response = await self._client.xreadgroup(
+                self._config.group, self.id, {stream: "0"}, count=len(taken) + 100
+            )
+        except redis.ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            await self._ensure_group(stream)  # the stream was deleted meanwhile
+            return []
+        return [
+            (entry_id, fields)
+            for entry_id, fields in self._entries(response)
+            if entry_id is None or _text(entry_id) not in taken
+        ]
+
+    async def _reclaim(
+        self, queue: str, stream: str, start_id: str = "0-0"
+    ) -> tuple[list[tuple[Any, Any]], str]:
+        """Take over jobs whose worker stopped touching them, and prune dead consumers.
+
+        Returns the reclaimed entries and the XAUTOCLAIM cursor to continue
+        from ("0-0" once the whole pending list has been scanned).
+        """
+        # Snapshot before any await, for the same in-flight-finish race as in
+        # _backlog: a job that finishes while the XAUTOCLAIM reply travels
+        # must still be filtered out.
+        taken = set(self._taken.get(stream, ()))
+        server_sec, server_usec = await self._client.time()
+        self._clock_offset = server_sec + server_usec / 1e6 - time.time()
+        try:
+            reply = await self._client.xautoclaim(
+                stream,
+                self._config.group,
+                self.id,
+                min_idle_time=int(self._config.reclaim_idle * 1000),
+                start_id=start_id,
+                count=100,
+            )
+        except redis.ResponseError as exc:
+            if "unknown command" in str(exc).lower():
+                raise CommandDeniedError(
+                    f"DispatchWorker requires Redis >= 6.2 (XAUTOCLAIM): {exc}",
+                    operation="dispatch_reclaim",
+                    original=exc,
+                ) from exc
+            if "NOGROUP" in str(exc):
+                await self._ensure_group(stream)  # the stream was deleted meanwhile
+                return [], "0-0"
+            raise
+        cursor = _text(reply[0])
+        # Jobs this worker is handling right now must not be re-run: the touch
+        # loop can fall behind (network hiccup, stalled event loop) for longer
+        # than reclaim_idle, and XAUTOCLAIM would then hand the worker its own
+        # live job a second time. The claim transfer is harmless (we own them
+        # already, and the idle reset doubles as a touch) - running them again
+        # is not.
+        entries = [
+            (entry_id, fields)
+            for entry_id, fields in reply[1]
+            if entry_id is None or _text(entry_id) not in taken
+        ]
+        now = time.monotonic()
+        abandoned = 0
+        for entry_id, _ in entries:
+            key = (stream, _text(entry_id)) if entry_id is not None else None
+            if key in self._requeued:
+                del self._requeued[key]  # requeued by this worker on purpose
+                continue
+            abandoned += 1
+        if abandoned:
+            logger.warning(
+                "Worker %s reclaimed %d abandoned job(s) from %s", self.id, abandoned, stream
+            )
+            for _ in range(abandoned):
+                _record_job(queue, self._config.namespace, "reclaimed")
+        # Forget requeues another worker picked up (leadership moved meanwhile).
+        stale = now - 10 * self._config.reclaim_idle
+        self._requeued = {k: t for k, t in self._requeued.items() if t > stale}
+        if time.monotonic() >= self._next_prune.get(stream, 0.0):
+            # Pruning dead consumers is bookkeeping: one XINFO per
+            # reclaim_idle is plenty, no need for one per reclaim tick.
+            self._next_prune[stream] = time.monotonic() + self._config.reclaim_idle
+            try:
+                consumers = await self._client.xinfo_consumers(stream, self._config.group)
+            except redis.ResponseError as exc:
+                if "NOGROUP" not in str(exc):
+                    raise
+                consumers = []  # the stream was deleted meanwhile
+            for consumer in consumers:
+                name = _text(consumer["name"])
+                idle_ms = self._config.reclaim_idle * 1000
+                if name != self.id and consumer["pending"] == 0 and consumer["idle"] > idle_ms:
+                    await self._client.xgroup_delconsumer(stream, self._config.group, name)
+        return entries, cursor
+
+    async def _touch_loop(self) -> None:
+        """Reset the idle time of our unanswered jobs, so they are not reclaimed."""
+        while True:
+            await asyncio.sleep(self._config.reclaim_idle / 3)
+            for stream, ids in list(self._taken.items()):
+                try:
+                    async with self._claim_lock:
+                        # Re-snapshot under the lock: entries handed back while
+                        # we waited for it must not be touched again.
+                        current: list[Any] = list(ids)
+                        if not current:
+                            continue
+                        await self._client.xclaim(
+                            stream, self._config.group, self.id, 0, current, justid=True
+                        )
+                except (redis.RedisError, OSError):
+                    logger.warning("Worker %s failed to touch jobs in %s", self.id, stream)
+
+    async def _hand_back(self, stream: str, entry_ids: list[Any]) -> None:
+        """Make taken-but-unstarted jobs reclaimable by the next leader right away."""
+        # Redis 6.2 XAUTOCLAIM reports entries deleted while pending as nil ids.
+        entry_ids = [entry_id for entry_id in entry_ids if entry_id is not None]
+        for entry_id in entry_ids:
+            self._taken.get(stream, set()).discard(_text(entry_id))
+        if not entry_ids:
+            return
+        try:
+            async with self._claim_lock:
+                await self._client.xclaim(
+                    stream,
+                    self._config.group,
+                    self.id,
+                    0,
+                    entry_ids,
+                    idle=int(self._config.reclaim_idle * 1000),
+                    justid=True,
+                )
+        except (redis.RedisError, OSError):
+            logger.debug("Worker %s: hand back failed", self.id, exc_info=True)
+
+    # -- one job --------------------------------------------------------------
+
+    async def _dispatch(
+        self,
+        queue: str,
+        stream: str,
+        entry_id: Any,
+        fields: Any,
+        reclaimed: bool,
+        mutex: Mutex,
+    ) -> bool:
+        """Run one job until it is admitted. Returns False if the queue must be left."""
+        if entry_id is None:
+            # Deleted while pending: Redis < 7 replies nil to XAUTOCLAIM, with
+            # no id to acknowledge.
+            return True
+        entry = _text(entry_id)
+        if not fields:
+            # Deleted while pending (XREADGROUP "0" shows these as empty
+            # field maps, Redis 6.2 XAUTOCLAIM as nil): just acknowledge.
+            self._taken.get(stream, set()).discard(entry)
+            await self._client.xack(stream, self._config.group, entry)
+            return True
+        try:
+            job = self._decode(queue, entry, fields, reclaimed)
+        except (KeyError, ValueError):
+            logger.error("Worker %s: dropping malformed job %s in %s", self.id, entry, stream)
+            self._taken.get(stream, set()).discard(entry)
+            await self._client.xack(stream, self._config.group, entry)
+            await self._client.xdel(stream, entry)
+            return True
+        if job.remaining is not None and job.remaining <= 0:
+            # The submitter has given up already.
+            logger.info("Worker %s: dropping expired job %s", self.id, job.id)
+            _record_job(queue, self._config.namespace, "expired")
+            self._taken.get(stream, set()).discard(entry)
+            await self._client.xack(stream, self._config.group, entry)
+            await self._client.xdel(stream, entry)
+            return True
+
+        cap = self._config.max_admitted
+        if cap is not None:
+            # The entry is taken (and touched), so waiting here is safe: the
+            # next job starts only once a handler slot frees up - FIFO holds.
+            running = self._stream_handlers.setdefault(stream, set())
+            while len(running) >= cap:
+                if not mutex.is_acquired or self._stopping.is_set():
+                    await self._hand_back(stream, [entry])
+                    return False
+                await asyncio.wait(
+                    set(running), timeout=_LEADERSHIP_CHECK, return_when=asyncio.FIRST_COMPLETED
+                )
+
+        self._taken.setdefault(stream, set()).add(entry)
+        task = asyncio.create_task(self._run_job(stream, job))
+        self._handlers.add(task)
+        task.add_done_callback(self._handlers.discard)
+        stream_handlers = self._stream_handlers.setdefault(stream, set())
+        stream_handlers.add(task)
+        task.add_done_callback(stream_handlers.discard)
+        task.add_done_callback(lambda _: job._settled.set())
+
+        try:
+            while not job._settled.is_set():
+                if not mutex.is_acquired or self._stopping.is_set():
+                    await self._abandon(stream, job, task)
+                    return False
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(job._settled.wait(), timeout=_LEADERSHIP_CHECK)
+        except asyncio.CancelledError:
+            if not job._settled.is_set():
+                await self._abandon(stream, job, task)
+            raise
+        if task.cancelled() and not job.admitted:
+            # A hard shutdown cancelled the handler before admission (settling
+            # the job, so the loop above exited normally): hand the entry back
+            # now instead of parking it for reclaim_idle.
+            await self._hand_back(stream, [job.entry_id])
+            return False
+        return True
+
+    async def _abandon(self, stream: str, job: Job, task: asyncio.Task[None]) -> None:
+        """Cancel a not-yet-admitted job and hand it back to the queue."""
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if job.admitted or not task.cancelled():
+            return  # it got admitted or finished meanwhile
+        await self._hand_back(stream, [job.entry_id])
+
+    def _decode(self, queue: str, entry_id: str, fields: dict[Any, Any], reclaimed: bool) -> Job:
+        data = {_text(key): _text(value) for key, value in fields.items()}
+        return Job(
+            queue=queue,
+            entry_id=entry_id,
+            id=data["id"],
+            payload=json.loads(data["payload"]),
+            created=float(data["created"]) / 1000,
+            deadline=float(data["deadline"]) / 1000 if data["deadline"] else None,
+            reclaimed=reclaimed,
+            clock_offset=self._clock_offset,
+        )
+
+    async def _run_job(self, stream: str, job: Job) -> None:
+        try:
+            result = await self._handler(job)
+            reply = json.dumps({"ok": True, "result": result})
+            outcome = "completed"
+        except asyncio.CancelledError:
+            raise  # handed back (not admitted) or forced shutdown: no reply
+        except RequeueJob as exc:
+            await self._requeue(stream, job, exc.delay)
+            return
+        except JobError as exc:
+            reply = self._error_reply(exc, exc.data)
+            outcome = "failed"
+        except Exception as exc:
+            logger.warning("Worker %s: job %s failed", self.id, job.id, exc_info=True)
+            # Keep the one structured detail waiters can act on.
+            data = {}
+            if isinstance(exc, RateLimitTimeoutError):
+                data = {"retry_after": exc.retry_after}
+            reply = self._error_reply(exc, data)
+            outcome = "failed"
+        await self._finish(stream, job, reply)
+        _record_job(job.queue, self._config.namespace, outcome)
+
+    async def _requeue(self, stream: str, job: Job, delay: float) -> None:
+        """Put the job back (no reply): the leader re-runs it before unread jobs."""
+        logger.info("Worker %s: requeue job %s (delay %.3fs)", self.id, job.id, delay)
+        _record_job(job.queue, self._config.namespace, "requeued")
+        if delay > 0:
+            # Still taken (and touched) meanwhile; stop() cuts the wait short.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stopping.wait(), timeout=delay)
+        self._requeued[(stream, job.entry_id)] = time.monotonic()
+        await self._hand_back(stream, [job.entry_id])
+        self._reclaim_now.add(stream)
+
+    @staticmethod
+    def _error_reply(exc: Exception, data: dict) -> str:
+        message = {"ok": False, "error_type": type(exc).__name__, "message": str(exc)}
+        try:
+            return json.dumps({**message, "data": data})
+        except (TypeError, ValueError):
+            return json.dumps(message)
+
+    async def _finish(self, stream: str, job: Job, reply: str) -> None:
+        """Deliver the reply and remove the job from the queue, atomically."""
+        reply_key = self._keys.reply(job.queue, job.id)
+        try:
+            pipe = self._client.pipeline(transaction=True)
+            pipe.lpush(reply_key, reply)
+            pipe.pexpire(reply_key, int(self._config.reply_ttl * 1000))
+            pipe.xack(stream, self._config.group, job.entry_id)
+            pipe.xdel(stream, job.entry_id)
+            await pipe.execute()
+        except (redis.RedisError, OSError):
+            # Left pending and untouched: the job is re-run after reclaim_idle.
+            logger.error("Worker %s: could not finish job %s", self.id, job.id, exc_info=True)
+        finally:
+            self._taken.get(stream, set()).discard(job.entry_id)

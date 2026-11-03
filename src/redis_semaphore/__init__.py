@@ -63,32 +63,49 @@ from .connection import (
     RedisConnectionFactory,
     SentinelConfig,
 )
+from .dispatch import DispatchQueue, DispatchWorker, Job, JobHandler, default_worker_id
 from .errors import (
     AcquireError,
     AcquireTimeoutError,
     AlreadyAcquiredError,
     BackendError,
     CommandDeniedError,
+    DispatchError,
+    JobError,
+    JobFailedError,
+    JobTimeoutError,
     LockLostError,
     MixedModeError,
     NotAcquiredError,
     PermanentBackendError,
+    QueueFullError,
+    RateLimitTimeoutError,
     RedisConnectionError,
     RedisSemaphoreError,
     ReleaseError,
+    RequeueJob,
     TransientBackendError,
 )
 from .logger import logger, set_logger
 from .metrics import PrometheusMetrics, set_metrics
+from .rate_limiter import RateLimiter
 from .semaphore import LockLostCallback, Mutex, Semaphore
 from .types import (
     AcquireMode,
     AcquireResult,
+    DispatchConfig,
     LockState,
+    QueueStatus,
+    RateLimit,
+    RateLimiterConfig,
+    RateLimiterStatus,
+    RateLimitUsage,
+    RatePermit,
     ReacquirePolicy,
     SemaphoreConfig,
     SemaphoreStatus,
     TimeSource,
+    WorkerHealth,
 )
 
 __version__ = "0.2.0"
@@ -97,19 +114,32 @@ __all__ = [
     # Config types
     "AcquireMode",
     "AcquireResult",
+    "DispatchConfig",
     "LockState",
+    "QueueStatus",
+    "RateLimit",
+    "RateLimitUsage",
+    "RateLimiterConfig",
+    "RateLimiterStatus",
+    "RatePermit",
     "ReacquirePolicy",
     "RedisConfig",
     "SemaphoreConfig",
     "SemaphoreStatus",
     "SentinelConfig",
     "TimeSource",
+    "WorkerHealth",
     # Connection
     "RedisConnectionFactory",
     # Primitives
+    "DispatchQueue",
+    "DispatchWorker",
+    "Job",
     "Mutex",
+    "RateLimiter",
     "Semaphore",
     # Type aliases
+    "JobHandler",
     "LockLostCallback",
     # Errors
     "AcquireError",
@@ -117,14 +147,23 @@ __all__ = [
     "AlreadyAcquiredError",
     "BackendError",
     "CommandDeniedError",
+    "DispatchError",
+    "JobError",
+    "JobFailedError",
+    "JobTimeoutError",
     "LockLostError",
     "MixedModeError",
     "NotAcquiredError",
     "PermanentBackendError",
+    "QueueFullError",
+    "RateLimitTimeoutError",
     "RedisConnectionError",
     "RedisSemaphoreError",
     "ReleaseError",
+    "RequeueJob",
     "TransientBackendError",
+    # Helpers
+    "default_worker_id",
     # Logging & Metrics
     "PrometheusMetrics",
     "logger",

@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RateLimiter`: distributed sliding-window rate limiter with weighted costs
+  and several limits checked atomically (e.g. requests-per-minute plus
+  tokens-per-minute). `acquire(cost)` / `aacquire(cost)` admit a request only
+  if it fits every limit, returning a `RatePermit` with a server-computed
+  `retry_after` on denial; `adjust()` / `aadjust()` settle a reservation with
+  the real cost (or refund it with `0`); `status()` / `astatus()` report
+  per-limit usage. Blocking acquire fails fast with the new
+  `RateLimitTimeoutError` when the request cannot fit before
+  `acquire_timeout`. New types: `RateLimit`, `RateLimiterConfig`,
+  `RatePermit`, `RateLimiterStatus`, `RateLimitUsage`. Limiter names may be
+  any string; `RateLimit` names must not contain `:` (they follow the
+  limiter name in the Redis key, so `:` would let different limiters share
+  keys)
+- Shared dispatch queue: `DispatchQueue` (`asubmit()` / `submit()`) and
+  `DispatchWorker` keep FIFO job queues in Redis Streams shared by many
+  processes/pods. One worker leads each queue at a time (via `Mutex`); its
+  handler runs one job at a time until `job.admit()`, so a resource acquired
+  before `admit()` is granted in arrival order across pods (FIFO while the
+  queue's leader is stable; jobs re-run after a crash return after
+  `reclaim_idle` and may follow newer jobs) while the
+  rest of the work runs concurrently. Failover after `leader_ttl`,
+  at-least-once re-run of jobs of dead workers after `reclaim_idle`,
+  graceful `stop()` that hands back unadmitted jobs. Requires Redis >=
+  6.2 (XAUTOCLAIM, BLMOVE); RESP2 and RESP3 clients both work. Enqueue
+  and the reply channel are idempotent under client auto-retries (a
+  resent enqueue reuses the entry it created; the reply is read
+  non-destructively), job timestamps/deadlines come from the Redis
+  server clock (no NTP sync between pods), `max_admitted` caps the
+  admitted concurrency per queue, and job outcomes are exported via the
+  new `inc_dispatch_job` metrics hook
+  (completed/failed/requeued/reclaimed/expired). New types:
+  `DispatchConfig`, `Job`, `JobHandler`; new errors: `DispatchError`,
+  `QueueFullError`, `JobTimeoutError`, `JobFailedError`, `JobError`
+- `RequeueJob(delay=0)`: raised from a dispatch handler, it puts the job back
+  into its queue without replying; the leader re-runs it (`job.reclaimed`)
+  before jobs not started yet. Raised before `admit()` with a delay, the
+  queue waits too, so the job keeps its place
+- Health checks for the dispatch queue: `DispatchQueue.astatus()` /
+  `status()` (and `astatus_many()` / `status_many()`) return a `QueueStatus`
+  (length, in_progress, waiting, oldest_age, has_leader) observed atomically
+  on the server; `DispatchWorker.health()` returns a local `WorkerHealth`
+  (running, leading, jobs_in_progress, last_loop_age, last Redis error,
+  `healthy` for readiness probes)
+
 ## [0.2.0] - 2026-08-10
 
 ### Added
