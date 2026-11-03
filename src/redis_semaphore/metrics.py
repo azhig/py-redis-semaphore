@@ -23,6 +23,8 @@ class MetricsCollector(Protocol):
 
     def inc_lock_lost(self, name: str, namespace: str) -> None: ...
 
+    def inc_dispatch_job(self, queue: str, namespace: str, result: str) -> None: ...
+
 
 class _NoopMetrics:
     @property
@@ -47,6 +49,9 @@ class _NoopMetrics:
         return None
 
     def inc_lock_lost(self, name: str, namespace: str) -> None:
+        return None
+
+    def inc_dispatch_job(self, queue: str, namespace: str, result: str) -> None:
         return None
 
 
@@ -128,6 +133,13 @@ class PrometheusMetrics:
             ["name", "namespace"],
             registry=registry,
         )
+        self._dispatch_jobs = Counter(
+            "redis_semaphore_dispatch_jobs_total",
+            "Dispatch queue jobs by outcome "
+            "(completed/failed/requeued/reclaimed/expired)",
+            ["queue", "namespace", "result"],
+            registry=registry,
+        )
 
     @property
     def enabled(self) -> bool:
@@ -154,3 +166,6 @@ class PrometheusMetrics:
 
     def inc_lock_lost(self, name: str, namespace: str) -> None:
         self._lock_lost.labels(name=name, namespace=namespace).inc()
+
+    def inc_dispatch_job(self, queue: str, namespace: str, result: str) -> None:
+        self._dispatch_jobs.labels(queue=queue, namespace=namespace, result=result).inc()

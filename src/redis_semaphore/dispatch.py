@@ -59,6 +59,7 @@ from .errors import (
 )
 from .logger import logger
 from .lua_scripts import LuaScriptRegistry, LuaScriptRunner, ScriptClientAdapter
+from .metrics import get_metrics
 from .semaphore import _BLPOP_SOCKET_TIMEOUT_FRACTION, Mutex, _client_socket_timeout
 from .types import DispatchConfig, QueueStatus, WorkerHealth
 
@@ -225,6 +226,16 @@ def _wait_error_pause(give_up: float | None) -> float:
 def _check_queue_name(queue: str) -> None:
     if not queue:
         raise ValueError("queue name must not be empty")
+
+
+def _record_job(queue: str, namespace: str, result: str) -> None:
+    """Count a job outcome (completed/failed/requeued/reclaimed/expired)."""
+    metrics = get_metrics()
+    if not metrics.enabled:
+        return
+    inc = getattr(metrics, "inc_dispatch_job", None)
+    if inc is not None:  # custom collectors may predate this hook
+        inc(queue, namespace, result)
 
 
 def _parse_reply(raw: bytes | str) -> Any:
@@ -401,11 +412,13 @@ class DispatchQueue:
         """
         _check_queue_name(queue)
         with backend_errors("dispatch_status", queue):
-            length, in_progress, oldest_ms = await self._runner.dispatch_status_async(
-                self._script_client, self._keys.stream(queue), self._config.group
-            )
-            leaders, _, _ = await self._runner.status_async(
-                self._script_client, self._keys.leader_owners(queue), "", None
+            (length, in_progress, oldest_ms), (leaders, _, _) = await asyncio.gather(
+                self._runner.dispatch_status_async(
+                    self._script_client, self._keys.stream(queue), self._config.group
+                ),
+                self._runner.status_async(
+                    self._script_client, self._keys.leader_owners(queue), "", None
+                ),
             )
         return self._build_status(queue, length, in_progress, oldest_ms, leaders)
 
@@ -508,6 +521,9 @@ class DispatchWorker:
         self._config = config or DispatchConfig()
         self._keys = _Keys(self._config)
         self._block_cap = _block_cap(client)
+        interval = self._config.election_interval
+        # Same None-default pattern as SemaphoreConfig.refresh_interval.
+        self._election_interval = interval if interval is not None else self._config.leader_ttl / 3
         self._stopping = asyncio.Event()
         self._running = False
         # Orders touch-loop XCLAIMs against _hand_back's: a touch landing after
@@ -525,6 +541,10 @@ class DispatchWorker:
         self._clock_offset = 0.0
         self._leading: dict[str, asyncio.Task[None]] = {}
         self._handlers: set[asyncio.Task[None]] = set()
+        # Handlers per stream, for the max_admitted cap.
+        self._stream_handlers: dict[str, set[asyncio.Task[None]]] = {}
+        # Throttles the consumer pruning (XINFO CONSUMERS) per stream.
+        self._next_prune: dict[str, float] = {}
         # stream -> entry ids taken by this worker and not answered yet
         self._taken: dict[str, set[str]] = {}
         # streams with a job just requeued: scan for it before reading new jobs
@@ -545,7 +565,7 @@ class DispatchWorker:
         :meth:`DispatchQueue.astatus` for the queues' global state.
         """
         now = time.monotonic()
-        stall_limit = 5 * self._config.election_interval
+        stall_limit = 5 * self._election_interval
         loop_age = None if self._last_loop is None else now - self._last_loop
         error_age = None if self._last_error is None else now - self._last_error[0]
         healthy = (
@@ -595,7 +615,7 @@ class DispatchWorker:
             while not self._stopping.is_set():
                 self._last_loop = time.monotonic()
                 await self._elect()
-                pause = self._config.election_interval * random.uniform(0.5, 1.5)
+                pause = self._election_interval * random.uniform(0.5, 1.5)
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self._stopping.wait(), timeout=pause)
         finally:
@@ -699,7 +719,7 @@ class DispatchWorker:
                     self._reclaim_now.discard(stream)
                     if forced:
                         reclaim_cursor = "0-0"
-                    entries, reclaim_cursor = await self._reclaim(stream, reclaim_cursor)
+                    entries, reclaim_cursor = await self._reclaim(queue, stream, reclaim_cursor)
                     if not entries:
                         # Deliveries this consumer never saw (the client resent
                         # XREADGROUP after a lost reply) sit in its own PEL:
@@ -801,7 +821,7 @@ class DispatchWorker:
         ]
 
     async def _reclaim(
-        self, stream: str, start_id: str = "0-0"
+        self, queue: str, stream: str, start_id: str = "0-0"
     ) -> tuple[list[tuple[Any, Any]], str]:
         """Take over jobs whose worker stopped touching them, and prune dead consumers.
 
@@ -852,14 +872,20 @@ class DispatchWorker:
             logger.warning(
                 "Worker %s reclaimed %d abandoned job(s) from %s", self.id, abandoned, stream
             )
+            for _ in range(abandoned):
+                _record_job(queue, self._config.namespace, "reclaimed")
         # Forget requeues another worker picked up (leadership moved meanwhile).
         stale = now - 10 * self._config.reclaim_idle
         self._requeued = {k: t for k, t in self._requeued.items() if t > stale}
-        for consumer in await self._client.xinfo_consumers(stream, self._config.group):
-            name = _text(consumer["name"])
-            idle_ms = self._config.reclaim_idle * 1000
-            if name != self.id and consumer["pending"] == 0 and consumer["idle"] > idle_ms:
-                await self._client.xgroup_delconsumer(stream, self._config.group, name)
+        if time.monotonic() >= self._next_prune.get(stream, 0.0):
+            # Pruning dead consumers is bookkeeping: one XINFO per
+            # reclaim_idle is plenty, no need for one per reclaim tick.
+            self._next_prune[stream] = time.monotonic() + self._config.reclaim_idle
+            for consumer in await self._client.xinfo_consumers(stream, self._config.group):
+                name = _text(consumer["name"])
+                idle_ms = self._config.reclaim_idle * 1000
+                if name != self.id and consumer["pending"] == 0 and consumer["idle"] > idle_ms:
+                    await self._client.xgroup_delconsumer(stream, self._config.group, name)
         return entries, cursor
 
     async def _touch_loop(self) -> None:
@@ -934,15 +960,32 @@ class DispatchWorker:
         if job.remaining is not None and job.remaining <= 0:
             # The submitter has given up already.
             logger.info("Worker %s: dropping expired job %s", self.id, job.id)
+            _record_job(queue, self._config.namespace, "expired")
             self._taken.get(stream, set()).discard(entry)
             await self._client.xack(stream, self._config.group, entry)
             await self._client.xdel(stream, entry)
             return True
 
+        cap = self._config.max_admitted
+        if cap is not None:
+            # The entry is taken (and touched), so waiting here is safe: the
+            # next job starts only once a handler slot frees up - FIFO holds.
+            running = self._stream_handlers.setdefault(stream, set())
+            while len(running) >= cap:
+                if not mutex.is_acquired or self._stopping.is_set():
+                    await self._hand_back(stream, [entry])
+                    return False
+                await asyncio.wait(
+                    set(running), timeout=_LEADERSHIP_CHECK, return_when=asyncio.FIRST_COMPLETED
+                )
+
         self._taken.setdefault(stream, set()).add(entry)
         task = asyncio.create_task(self._run_job(stream, job))
         self._handlers.add(task)
         task.add_done_callback(self._handlers.discard)
+        stream_handlers = self._stream_handlers.setdefault(stream, set())
+        stream_handlers.add(task)
+        task.add_done_callback(stream_handlers.discard)
         task.add_done_callback(lambda _: job._settled.set())
 
         try:
@@ -983,6 +1026,7 @@ class DispatchWorker:
         try:
             result = await self._handler(job)
             reply = json.dumps({"ok": True, "result": result})
+            outcome = "completed"
         except asyncio.CancelledError:
             raise  # handed back (not admitted) or forced shutdown: no reply
         except RequeueJob as exc:
@@ -990,14 +1034,18 @@ class DispatchWorker:
             return
         except JobError as exc:
             reply = self._error_reply(exc, exc.data)
+            outcome = "failed"
         except Exception as exc:
             logger.warning("Worker %s: job %s failed", self.id, job.id, exc_info=True)
             reply = self._error_reply(exc, {})
+            outcome = "failed"
         await self._finish(stream, job, reply)
+        _record_job(job.queue, self._config.namespace, outcome)
 
     async def _requeue(self, stream: str, job: Job, delay: float) -> None:
         """Put the job back (no reply): the leader re-runs it before unread jobs."""
         logger.info("Worker %s: requeue job %s (delay %.3fs)", self.id, job.id, delay)
+        _record_job(job.queue, self._config.namespace, "requeued")
         if delay > 0:
             # Still taken (and touched) meanwhile; stop() cuts the wait short.
             with contextlib.suppress(asyncio.TimeoutError):

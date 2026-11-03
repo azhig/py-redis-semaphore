@@ -80,6 +80,7 @@ async def echo(job: Job):
         {"group": ""},
         {"max_queue_size": 0},
         {"max_queues_per_worker": 0},
+        {"max_admitted": 0},
         {"leader_ttl": 0},
         {"election_interval": 0},
         {"reclaim_idle": 0},
@@ -291,6 +292,89 @@ async def test_without_admit_jobs_run_one_by_one(async_redis_client):
     async with running(DispatchWorker(async_redis_client, ["seq"], handler, config)):
         await asyncio.gather(*(queue.asubmit("seq", i, timeout=10) for i in range(5)))
     assert state["max_active"] == 1
+
+
+async def test_election_interval_defaults_to_a_third_of_leader_ttl(async_redis_client):
+    """Probing busy queues much faster than leader_ttl only burns Redis."""
+    worker = DispatchWorker(async_redis_client, ["q"], echo, DispatchConfig(leader_ttl=9.0))
+    assert worker._election_interval == pytest.approx(3.0)
+
+
+async def test_max_admitted_caps_concurrency(async_redis_client):
+    """With max_admitted, the leader starts the next job only when a handler
+    slot frees up; without it, admitted jobs run unbounded."""
+    state = {"active": 0, "max": 0}
+
+    async def handler(job: Job):
+        job.admit()
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        await asyncio.sleep(0.15)
+        state["active"] -= 1
+        return job.payload
+
+    config = _config(max_admitted=2)
+    queue = DispatchQueue(async_redis_client, config)
+    async with running(DispatchWorker(async_redis_client, ["capped"], handler, config)):
+        results = await asyncio.gather(*(queue.asubmit("capped", i, timeout=10) for i in range(6)))
+    assert sorted(results) == list(range(6))
+    assert state["max"] == 2
+
+
+async def test_dispatch_job_metrics(async_redis_client):
+    from redis_semaphore.metrics import get_metrics, set_metrics
+
+    class Collector:
+        def __init__(self):
+            self.jobs = []
+
+        @property
+        def enabled(self):
+            return True
+
+        def inc_dispatch_job(self, queue, namespace, result):
+            self.jobs.append((queue, namespace, result))
+
+        def __getattr__(self, name):  # the semaphore hooks used by elections
+            return lambda *args, **kwargs: None
+
+    async def handler(job: Job):
+        if job.payload == "boom":
+            raise ValueError("boom")
+        return "ok"
+
+    collector = Collector()
+    previous = get_metrics()
+    set_metrics(collector)
+    try:
+        config = _config()
+        queue = DispatchQueue(async_redis_client, config)
+        async with running(DispatchWorker(async_redis_client, ["measured"], handler, config)):
+            assert await queue.asubmit("measured", "fine", timeout=5) == "ok"
+            with pytest.raises(JobFailedError):
+                await queue.asubmit("measured", "boom", timeout=5)
+    finally:
+        set_metrics(previous)
+    assert ("measured", "t-dispatch", "completed") in collector.jobs
+    assert ("measured", "t-dispatch", "failed") in collector.jobs
+
+
+def test_record_job_tolerates_old_collectors():
+    """Custom collectors written before inc_dispatch_job existed must not break."""
+    from redis_semaphore.dispatch import _record_job
+    from redis_semaphore.metrics import get_metrics, set_metrics
+
+    class Old:
+        @property
+        def enabled(self):
+            return True
+
+    previous = get_metrics()
+    set_metrics(Old())
+    try:
+        _record_job("q", "ns", "completed")  # must not raise
+    finally:
+        set_metrics(previous)
 
 
 async def test_queues_spread_over_workers(async_redis_client):

@@ -350,7 +350,13 @@ class DispatchConfig:
         leader_ttl: TTL of a queue's leadership Mutex. A dead worker's
             queues get a new leader after at most this long.
         election_interval: Mean pause between a worker's attempts to take
-            one more free queue.
+            one more free queue (None = leader_ttl / 3). Every attempt on a
+            busy queue is a failed non-blocking Mutex acquire - it shows up
+            in the semaphore metrics as result="busy" - and probing much
+            faster than leader_ttl buys nothing, so keep this coarse.
+        max_admitted: Max admitted jobs of one queue running concurrently on
+            its leader (None = unlimited). At the cap the leader waits for a
+            handler to finish before starting the next job (FIFO is kept).
         reclaim_idle: A job taken by a worker that has not been touched for
             this long is presumed abandoned (its worker died) and is re-run
             by the queue's current leader. Live workers touch their jobs every
@@ -370,12 +376,13 @@ class DispatchConfig:
     group: str = "dispatchers"
     max_queue_size: int | None = None
     leader_ttl: float = 10.0
-    election_interval: float = 1.0
+    election_interval: float | None = None
     reclaim_idle: float = 30.0
     reclaim_interval: float = 5.0
     reply_ttl: float = 60.0
     read_timeout: float = 1.0
     max_queues_per_worker: int | None = None
+    max_admitted: int | None = None
     cluster_hash_tags: bool = False
 
     def __post_init__(self) -> None:
@@ -387,9 +394,12 @@ class DispatchConfig:
             raise ValueError("max_queue_size must be >= 1 or None")
         if self.max_queues_per_worker is not None and self.max_queues_per_worker < 1:
             raise ValueError("max_queues_per_worker must be >= 1 or None")
+        if self.max_admitted is not None and self.max_admitted < 1:
+            raise ValueError("max_admitted must be >= 1 or None")
+        if self.election_interval is not None and self.election_interval <= 0:
+            raise ValueError("election_interval must be > 0 or None")
         for name in (
             "leader_ttl",
-            "election_interval",
             "reclaim_idle",
             "reclaim_interval",
             "reply_ttl",
