@@ -135,8 +135,7 @@ class PrometheusMetrics:
         )
         self._dispatch_jobs = Counter(
             "redis_semaphore_dispatch_jobs_total",
-            "Dispatch queue jobs by outcome "
-            "(completed/failed/requeued/reclaimed/expired)",
+            "Dispatch queue jobs by outcome (completed/failed/requeued/reclaimed/expired)",
             ["queue", "namespace", "result"],
             registry=registry,
         )
