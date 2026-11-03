@@ -16,8 +16,10 @@
   the handler calls ``job.admit()`` (or returns). The rest of the handler runs
   concurrently with the following jobs. Waiting for a scarce resource (e.g. a
   RateLimiter permit) before ``admit()`` therefore grants that resource in
-  strict FIFO order across all processes, while the slow part (the request
-  itself) runs in parallel.
+  FIFO order across all processes while the queue's leader is stable, and the
+  slow part (the request itself) runs in parallel. After a worker crash the
+  jobs it had taken return via reclaim (up to reclaim_idle later) while new
+  jobs keep flowing, so ordering is not guaranteed across a failover.
 - If a worker dies, its Mutexes expire after leader_ttl and other workers take
   over its queues. Jobs it had taken but not answered stay in the stream's
   pending list; a live worker touches its jobs, so after reclaim_idle without

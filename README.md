@@ -148,7 +148,7 @@ The same instance supports `aacquire()` / `aadjust()` / `astatus()` with an
 async client. See `examples/rate_limited_agents.py` for agents with
 per-agent queues spreading load over several certificates.
 
-### Shared dispatch queue (many pods, strict FIFO)
+### Shared dispatch queue (many pods, FIFO)
 
 `RateLimiter` decides *whether* a request may go now; it does not queue
 requests. When many processes or pods share a quota and requests must get it
@@ -201,7 +201,9 @@ How it works:
   over. Jobs it had taken stay pending; live workers touch their jobs, so
   after `reclaim_idle` without that the new leader re-runs them
   (`job.reclaimed=True`). **Delivery is at-least-once** - use `job.id` as an
-  idempotency key if a repeat is harmful.
+  idempotency key if a repeat is harmful. Reclaimed jobs come back up to
+  `reclaim_idle` later while new jobs keep flowing, so FIFO order holds
+  under a stable leader but **not across a crash failover**.
 - Graceful shutdown (`worker.stop()`, e.g. on SIGTERM): jobs not admitted yet
   are handed back to the queue at once, admitted ones run to completion.
 - Deadlines use the Redis server clock (stamped inside the enqueue script),

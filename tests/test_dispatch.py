@@ -21,10 +21,13 @@ from redis_semaphore import (
 
 pytestmark = pytest.mark.timeout(30)
 
+# Keep the production *proportions* (reclaim_idle > leader_ttl, defaults
+# 30 > 10): inverting them would re-elect slower than reclaim and hide the
+# post-crash reordering window that production configs have.
 FAST = {
-    "leader_ttl": 0.9,
+    "leader_ttl": 0.5,
     "election_interval": 0.05,
-    "reclaim_idle": 0.6,
+    "reclaim_idle": 0.8,
     "reclaim_interval": 0.1,
     "read_timeout": 0.1,
 }

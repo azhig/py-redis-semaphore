@@ -26,7 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DispatchWorker` keep FIFO job queues in Redis Streams shared by many
   processes/pods. One worker leads each queue at a time (via `Mutex`); its
   handler runs one job at a time until `job.admit()`, so a resource acquired
-  before `admit()` is granted in strict arrival order across pods while the
+  before `admit()` is granted in arrival order across pods (FIFO while the
+  queue's leader is stable; jobs re-run after a crash return after
+  `reclaim_idle` and may follow newer jobs) while the
   rest of the work runs concurrently. Failover after `leader_ttl`,
   at-least-once re-run of jobs of dead workers after `reclaim_idle`,
   graceful `stop()` that hands back unadmitted jobs. New types:
