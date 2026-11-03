@@ -369,7 +369,10 @@ class DispatchConfig:
             With a cap, make sure workers x cap >= queues, or some queues
             stay without a leader.
         cluster_hash_tags: If True, keys of one queue share a Redis Cluster
-            hash tag (``{namespace:queue}:...``). Changes key names.
+            hash tag (``{namespace:queue}:...``). Changes key names. The
+            queue's leadership Mutex gets its own tag
+            (``{namespace:queue:leader}:...``), so it may land in a different
+            slot than the stream - fine, since no script mixes the two.
     """
 
     namespace: str = "dispatch"
@@ -416,8 +419,9 @@ class QueueStatus:
     Attributes:
         name: Queue name.
         length: Jobs in the queue: waiting + in progress.
-        in_progress: Jobs taken by a worker and not finished yet - the one
-            waiting for admission plus the admitted ones still running.
+        in_progress: Jobs delivered to a worker and not acknowledged yet: the
+            one awaiting admission, admitted ones still running, and jobs
+            waiting to be re-run after their worker died.
         waiting: Jobs nobody has taken yet.
         oldest_age: Seconds since the oldest job in the queue was submitted
             (Redis server clock), or None if the queue is empty. Growing

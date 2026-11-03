@@ -167,6 +167,42 @@ async def test_handler_errors(async_redis_client):
         assert structured.value.data == {"retry_after": 1.5}
 
 
+async def test_rate_limit_timeout_keeps_retry_after(async_redis_client):
+    """RateLimitTimeoutError.retry_after survives the reply JSON round-trip."""
+    from redis_semaphore import RateLimitTimeoutError
+
+    async def handler(job: Job):
+        raise RateLimitTimeoutError("no quota", retry_after=1.5)
+
+    config = _config()
+    queue = DispatchQueue(async_redis_client, config)
+    async with running(DispatchWorker(async_redis_client, ["quota"], handler, config)):
+        with pytest.raises(JobFailedError) as info:
+            await queue.asubmit("quota", None, timeout=5)
+    assert info.value.error_type == "RateLimitTimeoutError"
+    assert info.value.data == {"retry_after": 1.5}
+
+
+async def test_mixed_client_is_rejected(redis_client, async_redis_client):
+    """Sync methods on an async client (and vice versa) fail with a clear
+    error instead of a TypeError deep inside redis-py."""
+    from redis_semaphore import MixedModeError
+
+    config = _config()
+    with pytest.raises(MixedModeError):
+        DispatchQueue(async_redis_client, config).length("q")
+    with pytest.raises(MixedModeError):
+        DispatchQueue(async_redis_client, config).submit("q", None, timeout=1)
+    with pytest.raises(MixedModeError):
+        DispatchQueue(async_redis_client, config).status("q")
+    with pytest.raises(MixedModeError):
+        await DispatchQueue(redis_client, config).alength("q")
+    with pytest.raises(MixedModeError):
+        await DispatchQueue(redis_client, config).asubmit("q", None, timeout=1)
+    with pytest.raises(MixedModeError):
+        await DispatchQueue(redis_client, config).astatus("q")
+
+
 async def test_non_json_result_fails_job(async_redis_client):
     async def handler(job: Job):
         return object()

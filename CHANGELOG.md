@@ -31,7 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reclaim_idle` and may follow newer jobs) while the
   rest of the work runs concurrently. Failover after `leader_ttl`,
   at-least-once re-run of jobs of dead workers after `reclaim_idle`,
-  graceful `stop()` that hands back unadmitted jobs. New types:
+  graceful `stop()` that hands back unadmitted jobs. Requires Redis >=
+  6.2 (XAUTOCLAIM, BLMOVE); RESP2 and RESP3 clients both work. Enqueue
+  and the reply channel are idempotent under client auto-retries (a
+  resent enqueue reuses the entry it created; the reply is read
+  non-destructively), job timestamps/deadlines come from the Redis
+  server clock (no NTP sync between pods), `max_admitted` caps the
+  admitted concurrency per queue, and job outcomes are exported via the
+  new `inc_dispatch_job` metrics hook
+  (completed/failed/requeued/reclaimed/expired). New types:
   `DispatchConfig`, `Job`, `JobHandler`; new errors: `DispatchError`,
   `QueueFullError`, `JobTimeoutError`, `JobFailedError`, `JobError`
 - `RequeueJob(delay=0)`: raised from a dispatch handler, it puts the job back

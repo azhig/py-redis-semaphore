@@ -52,7 +52,9 @@ from .errors import (
     JobError,
     JobFailedError,
     JobTimeoutError,
+    MixedModeError,
     QueueFullError,
+    RateLimitTimeoutError,
     RequeueJob,
     backend_errors,
     map_backend_error,
@@ -280,6 +282,14 @@ class DispatchQueue:
         """Redis key of the queue's stream."""
         return self._keys.stream(queue)
 
+    def _require_sync(self) -> None:
+        if isinstance(self._client, aioredis.Redis):
+            raise MixedModeError("This method needs a sync Redis client; use the a*() variant")
+
+    def _require_async(self) -> None:
+        if not isinstance(self._client, aioredis.Redis):
+            raise MixedModeError("This method needs a redis.asyncio client; use the sync variant")
+
     def _check_args(self, queue: str, timeout: float | None) -> None:
         _check_queue_name(queue)
         if timeout is not None and timeout <= 0:
@@ -312,6 +322,7 @@ class DispatchQueue:
             JobFailedError: The handler raised.
             BackendError: On Redis failure.
         """
+        self._require_async()
         self._check_args(queue, timeout)
         job_id = uuid.uuid4().hex
         with backend_errors("dispatch_submit", queue):
@@ -358,6 +369,7 @@ class DispatchQueue:
 
     def submit(self, queue: str, payload: Any = None, *, timeout: float | None = None) -> Any:
         """Sync version of :meth:`asubmit` (needs a sync client)."""
+        self._require_sync()
         self._check_args(queue, timeout)
         job_id = uuid.uuid4().hex
         with backend_errors("dispatch_submit", queue):
@@ -410,6 +422,7 @@ class DispatchQueue:
         Raises:
             BackendError: On Redis failure.
         """
+        self._require_async()
         _check_queue_name(queue)
         with backend_errors("dispatch_status", queue):
             (length, in_progress, oldest_ms), (leaders, _, _) = await asyncio.gather(
@@ -430,6 +443,7 @@ class DispatchQueue:
 
     def status(self, queue: str) -> QueueStatus:
         """Sync version of :meth:`astatus` (needs a sync client)."""
+        self._require_sync()
         _check_queue_name(queue)
         with backend_errors("dispatch_status", queue):
             length, in_progress, oldest_ms = self._runner.dispatch_status(
@@ -459,11 +473,13 @@ class DispatchQueue:
 
     async def alength(self, queue: str) -> int:
         """Jobs in the queue (waiting + in progress)."""
+        self._require_async()
         with backend_errors("dispatch_length", queue):
             return int(await self._client.xlen(self._keys.stream(queue)))
 
     def length(self, queue: str) -> int:
-        """Sync version of :meth:`alength`."""
+        """Sync version of :meth:`alength` (needs a sync client)."""
+        self._require_sync()
         with backend_errors("dispatch_length", queue):
             return int(self._client.xlen(self._keys.stream(queue)))  # type: ignore[arg-type]
 
@@ -1037,7 +1053,9 @@ class DispatchWorker:
             outcome = "failed"
         except Exception as exc:
             logger.warning("Worker %s: job %s failed", self.id, job.id, exc_info=True)
-            reply = self._error_reply(exc, {})
+            # Keep the one structured detail waiters can act on.
+            data = {"retry_after": exc.retry_after} if isinstance(exc, RateLimitTimeoutError) else {}
+            reply = self._error_reply(exc, data)
             outcome = "failed"
         await self._finish(stream, job, reply)
         _record_job(job.queue, self._config.namespace, outcome)

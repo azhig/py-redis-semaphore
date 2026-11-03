@@ -509,6 +509,10 @@ class Semaphore(BaseSemaphoreCommon[redis.Redis | aioredis.Redis]):
         remaining = self._remaining_time(state)
         if remaining is not None:
             timeout = min(timeout, remaining)
+        if timeout < 0.01:
+            # Redis before 7.0 truncates sub-ms timeouts to 0 = block forever;
+            # a wait this short is better skipped (the acquire loop re-checks).
+            return 0.0
         return timeout
 
     def _on_transient_wait_error(self, exc: BaseException) -> float:

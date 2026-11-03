@@ -10,6 +10,7 @@ Quotas live in Redis, so they hold across processes and machines.
 """
 
 import asyncio
+import os
 import random
 
 import redis.asyncio as aioredis
@@ -66,7 +67,7 @@ async def agent(name: str, limiters: list[RateLimiter], queue: asyncio.Queue[str
 
 
 async def main() -> None:
-    client = aioredis.Redis()
+    client = aioredis.Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
     agents = {
         f"agent-{a}": [make_limiter(client, f"agent-{a}:cert-{c}") for c in range(3)]
         for a in range(2)
