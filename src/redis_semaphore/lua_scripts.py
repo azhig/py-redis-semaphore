@@ -7,12 +7,18 @@ Redis data structures:
 
 - STRING: {namespace}:{name}:fencing
   - Monotonically increasing counter for fencing tokens
+
+Rate limiter (per limit):
+- ZSET: {namespace}:{name}:{limit}:log
+  - member: "<cost>:<identifier>", score: admission timestamp in milliseconds
+- STRING: {namespace}:{name}:{limit}:total
+  - Running sum of the costs currently in the log
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from typing import ClassVar, Protocol, TypeAlias
 
 import redis
@@ -229,6 +235,277 @@ return {current_count, is_owner, expires_at}
 )
 
 
+# =============================================================================
+# RATE LIMITER - sliding-window log with weighted entries
+# =============================================================================
+# Per limit i (name = RateLimit.name):
+#   KEYS[2i-1] = ZSET {namespace}:{name}:{limit}:log
+#                member "<cost>:<identifier>", score = admission time in ms
+#   KEYS[2i]   = STRING {namespace}:{name}:{limit}:total
+#                running sum of the costs in the log, so a check costs
+#                O(expired entries) instead of O(window size)
+# Both keys get a TTL of two windows on every write (one window of margin for
+# client-time skew), so abandoned limiters clean up.
+
+# Lua fragment: helpers shared by the rate limiter scripts.
+_LUA_RATE_HELPERS = """
+local function member_cost(member)
+    return tonumber(string.match(member, '^(%d+):')) or 0
+end
+
+local function touch(log_key, total_key, ttl_ms)
+    redis.call('PEXPIRE', log_key, ttl_ms)
+    redis.call('PEXPIRE', total_key, ttl_ms)
+end
+
+-- Rebuild the running total from the log (the total key was lost or drifted).
+local function recount(log_key, total_key, ttl_ms)
+    local total = 0
+    for _, member in ipairs(redis.call('ZRANGE', log_key, 0, -1)) do
+        total = total + member_cost(member)
+    end
+    redis.call('SET', total_key, total, 'PX', ttl_ms)
+    return total
+end
+
+-- Drop entries at or before cutoff and return the units still in the window.
+local function evict(log_key, total_key, cutoff, ttl_ms)
+    local expired = redis.call('ZRANGEBYSCORE', log_key, '-inf', cutoff)
+    local freed = 0
+    for _, member in ipairs(expired) do
+        freed = freed + member_cost(member)
+    end
+    if #expired > 0 then
+        redis.call('ZREMRANGEBYSCORE', log_key, '-inf', cutoff)
+    end
+    if redis.call('ZCARD', log_key) == 0 then
+        redis.call('DEL', total_key)
+        return 0
+    end
+    local raw = redis.call('GET', total_key)
+    if not raw then
+        return recount(log_key, total_key, ttl_ms)
+    end
+    local total = tonumber(raw)
+    if freed > 0 then
+        total = redis.call('DECRBY', total_key, freed)
+    end
+    if total < 0 then
+        return recount(log_key, total_key, ttl_ms)
+    end
+    return total
+end
+"""
+
+
+# -----------------------------------------------------------------------------
+# RATE_ACQUIRE - admit a weighted request if it fits every limit
+# -----------------------------------------------------------------------------
+# KEYS    = log/total pairs, see above
+# ARGV[1] = identifier (unique per request)
+# ARGV[2] = current_time_ms, or '' to use server time (TIME inside the script)
+# ARGV[3..] = per limit: limit, window_ms, cost
+#
+# Returns: [success (0/1), retry_after_ms, now_ms, used_1, ..., used_n]
+#   On failure nothing is recorded and retry_after_ms is the earliest moment
+#   (relative to now) at which enough units leave every violated window.
+RATE_ACQUIRE_SCRIPT = (
+    """
+local identifier = ARGV[1]
+"""
+    + _lua_resolve_now(2)
+    + _LUA_RATE_HELPERS
+    + """
+local n = #KEYS / 2
+local used = {}
+local retry_after = 0
+
+-- 1. Evict expired entries and check every limit (nothing is written yet).
+for i = 1, n do
+    local log_key, total_key = KEYS[2 * i - 1], KEYS[2 * i]
+    local base = 3 + (i - 1) * 3
+    local limit = tonumber(ARGV[base])
+    local window_ms = tonumber(ARGV[base + 1])
+    local cost = tonumber(ARGV[base + 2])
+    local total = evict(log_key, total_key, now_ms - window_ms, window_ms * 2)
+    used[i] = total
+    if cost > 0 and total + cost > limit then
+        -- Walk the log oldest-first (in chunks, stopping early) until enough
+        -- units would have expired.
+        local need = total + cost - limit
+        local wait = window_ms
+        local freed = 0
+        local start = 0
+        local found = false
+        while not found do
+            local entries = redis.call('ZRANGE', log_key, start, start + 127, 'WITHSCORES')
+            if #entries == 0 then break end
+            for j = 1, #entries, 2 do
+                freed = freed + member_cost(entries[j])
+                if freed >= need then
+                    wait = tonumber(entries[j + 1]) + window_ms - now_ms
+                    found = true
+                    break
+                end
+            end
+            start = start + 128
+        end
+        if wait < 1 then wait = 1 end
+        if wait > retry_after then retry_after = wait end
+    end
+end
+
+local result = {0, retry_after, now_ms}
+if retry_after > 0 then
+    for i = 1, n do result[3 + i] = used[i] end
+    return result
+end
+
+-- 2. Fits all limits: record the request in every window it is charged to.
+for i = 1, n do
+    local log_key, total_key = KEYS[2 * i - 1], KEYS[2 * i]
+    local base = 3 + (i - 1) * 3
+    local window_ms = tonumber(ARGV[base + 1])
+    local cost = ARGV[base + 2]
+    if tonumber(cost) > 0 then
+        redis.call('ZADD', log_key, now_ms, cost .. ':' .. identifier)
+        used[i] = redis.call('INCRBY', total_key, tonumber(cost))
+        touch(log_key, total_key, window_ms * 2)
+    end
+    result[3 + i] = used[i]
+end
+result[1] = 1
+return result
+"""
+)
+
+
+# -----------------------------------------------------------------------------
+# RATE_ADJUST - replace the recorded cost of an admitted request
+# -----------------------------------------------------------------------------
+# KEYS    = log/total pairs of the limits being adjusted
+# ARGV[1] = identifier of the admitted request
+# ARGV[2] = current_time_ms, or '' to use server time (TIME inside the script)
+# ARGV[3] = admission time in ms (as returned by RATE_ACQUIRE)
+# ARGV[4..] = per limit: window_ms, old_cost, new_cost
+#
+# Returns: [used_1, ..., used_n] after the adjustment. The new cost keeps the
+#   original admission time, so it leaves the window when the request would
+#   have; if the request already left the window, nothing is re-added.
+#   Overshooting a limit is allowed (the debt delays later acquires).
+RATE_ADJUST_SCRIPT = (
+    """
+local identifier = ARGV[1]
+"""
+    + _lua_resolve_now(2)
+    + _LUA_RATE_HELPERS
+    + """
+local acquired_at = tonumber(ARGV[3])
+local n = #KEYS / 2
+local used = {}
+
+for i = 1, n do
+    local log_key, total_key = KEYS[2 * i - 1], KEYS[2 * i]
+    local base = 4 + (i - 1) * 3
+    local window_ms = tonumber(ARGV[base])
+    local old_cost = ARGV[base + 1]
+    local new_cost = ARGV[base + 2]
+    local ttl_ms = window_ms * 2
+    local total = evict(log_key, total_key, now_ms - window_ms, ttl_ms)
+    if tonumber(old_cost) > 0
+        and redis.call('ZREM', log_key, old_cost .. ':' .. identifier) == 1 then
+        total = redis.call('DECRBY', total_key, tonumber(old_cost))
+    end
+    if tonumber(new_cost) > 0 and acquired_at > now_ms - window_ms then
+        -- Only count a member that is really new: a retried adjust (reply
+        -- lost after the script ran) finds it already recorded.
+        if redis.call('ZADD', log_key, acquired_at, new_cost .. ':' .. identifier) == 1 then
+            total = redis.call('INCRBY', total_key, tonumber(new_cost))
+        end
+        touch(log_key, total_key, ttl_ms)
+    elseif redis.call('ZCARD', log_key) == 0 then
+        redis.call('DEL', total_key)
+        total = 0
+    end
+    used[i] = total
+end
+return used
+"""
+)
+
+
+# -----------------------------------------------------------------------------
+# RATE_STATUS - current consumption without admitting anything
+# -----------------------------------------------------------------------------
+# KEYS    = log/total pairs, see above
+# ARGV[1] = current_time_ms, or '' to use server time (TIME inside the script)
+# ARGV[2..] = per limit: window_ms
+#
+# Returns: [used_1, ..., used_n]
+RATE_STATUS_SCRIPT = (
+    _lua_resolve_now(1)
+    + _LUA_RATE_HELPERS
+    + """
+local used = {}
+for i = 1, #KEYS / 2 do
+    local window_ms = tonumber(ARGV[1 + i])
+    used[i] = evict(KEYS[2 * i - 1], KEYS[2 * i], now_ms - window_ms, window_ms * 2)
+end
+return used
+"""
+)
+
+
+# =============================================================================
+# DISPATCH_ENQUEUE - append a job to a queue stream unless it is full
+# =============================================================================
+# KEYS[1] = queue stream key
+# ARGV[1] = max queue size (0 = unbounded)
+# ARGV[2..] = field/value pairs of the stream entry
+#
+# Returns: the new entry id, or nil if the queue is full.
+DISPATCH_ENQUEUE_SCRIPT = """
+-- XADD with an auto id is non-deterministic: Redis 5-6 need effect replication.
+if redis.replicate_commands then redis.replicate_commands() end
+local max_size = tonumber(ARGV[1])
+if max_size > 0 and redis.call('XLEN', KEYS[1]) >= max_size then
+    return false
+end
+return redis.call('XADD', KEYS[1], '*', unpack(ARGV, 2))
+"""
+
+
+# =============================================================================
+# DISPATCH_STATUS - observe a queue stream without changing it
+# =============================================================================
+# KEYS[1] = queue stream key
+# ARGV[1] = consumer group name
+#
+# Returns: [length, in_progress, oldest_age_ms (-1 if empty)]
+#   in_progress is the group's pending count (0 if the group does not exist
+#   yet); the oldest age comes from the first entry id and the server clock.
+DISPATCH_STATUS_SCRIPT = """
+local length = redis.call('XLEN', KEYS[1])
+if length == 0 then
+    return {0, 0, -1}
+end
+local in_progress = 0
+local pending = redis.pcall('XPENDING', KEYS[1], ARGV[1])
+if type(pending) == 'table' and not pending.err then
+    in_progress = tonumber(pending[1]) or 0
+end
+local oldest = -1
+local first = redis.call('XRANGE', KEYS[1], '-', '+', 'COUNT', 1)
+if first[1] then
+    local t = redis.call('TIME')
+    local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+    local added_ms = tonumber(string.match(first[1][1], '^(%d+)-'))
+    oldest = math.max(0, now_ms - added_ms)
+end
+return {length, in_progress, oldest}
+"""
+
+
 class LuaScriptRegistry:
     """Registry of Lua scripts and their locally computed SHAs.
 
@@ -243,6 +520,11 @@ class LuaScriptRegistry:
         "refresh": REFRESH_SCRIPT,
         "cleanup": CLEANUP_SCRIPT,
         "status": STATUS_SCRIPT,
+        "rate_acquire": RATE_ACQUIRE_SCRIPT,
+        "rate_adjust": RATE_ADJUST_SCRIPT,
+        "rate_status": RATE_STATUS_SCRIPT,
+        "dispatch_enqueue": DISPATCH_ENQUEUE_SCRIPT,
+        "dispatch_status": DISPATCH_STATUS_SCRIPT,
     }
 
     SHAS: ClassVar[dict[str, str]] = {
@@ -419,6 +701,185 @@ class LuaScriptRunner:
             identifier or "",
         )
         return _parse_status_result(result)
+
+    def rate_acquire(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        identifier: str,
+        now_ms: int | str,
+        limits: Sequence[tuple[int, int, int]],
+    ) -> tuple[bool, int, int, list[int]]:
+        """Admit a weighted request; ``limits`` holds (limit, window_ms, cost)."""
+        result: object = client.evalsha(
+            self._registry.get_sha("rate_acquire"),
+            len(keys),
+            *keys,
+            identifier,
+            now_ms,
+            *_flatten(limits),
+        )
+        return _parse_rate_acquire_result(result, len(limits))
+
+    async def rate_acquire_async(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        identifier: str,
+        now_ms: int | str,
+        limits: Sequence[tuple[int, int, int]],
+    ) -> tuple[bool, int, int, list[int]]:
+        """Async variant of :meth:`rate_acquire`."""
+        result: object = await client.aevalsha(
+            self._registry.get_sha("rate_acquire"),
+            len(keys),
+            *keys,
+            identifier,
+            now_ms,
+            *_flatten(limits),
+        )
+        return _parse_rate_acquire_result(result, len(limits))
+
+    def rate_adjust(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        identifier: str,
+        now_ms: int | str,
+        acquired_at_ms: int,
+        changes: Sequence[tuple[int, int, int]],
+    ) -> list[int]:
+        """Replace recorded costs; ``changes`` holds (window_ms, old, new)."""
+        result: object = client.evalsha(
+            self._registry.get_sha("rate_adjust"),
+            len(keys),
+            *keys,
+            identifier,
+            now_ms,
+            acquired_at_ms,
+            *_flatten(changes),
+        )
+        return _parse_int_list(result, len(changes))
+
+    async def rate_adjust_async(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        identifier: str,
+        now_ms: int | str,
+        acquired_at_ms: int,
+        changes: Sequence[tuple[int, int, int]],
+    ) -> list[int]:
+        """Async variant of :meth:`rate_adjust`."""
+        result: object = await client.aevalsha(
+            self._registry.get_sha("rate_adjust"),
+            len(keys),
+            *keys,
+            identifier,
+            now_ms,
+            acquired_at_ms,
+            *_flatten(changes),
+        )
+        return _parse_int_list(result, len(changes))
+
+    def rate_status(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        now_ms: int | str,
+        windows_ms: Sequence[int],
+    ) -> list[int]:
+        result: object = client.evalsha(
+            self._registry.get_sha("rate_status"),
+            len(keys),
+            *keys,
+            now_ms,
+            *windows_ms,
+        )
+        return _parse_int_list(result, len(windows_ms))
+
+    async def rate_status_async(
+        self,
+        client: ScriptClient,
+        keys: Sequence[str],
+        now_ms: int | str,
+        windows_ms: Sequence[int],
+    ) -> list[int]:
+        result: object = await client.aevalsha(
+            self._registry.get_sha("rate_status"),
+            len(keys),
+            *keys,
+            now_ms,
+            *windows_ms,
+        )
+        return _parse_int_list(result, len(windows_ms))
+
+    def dispatch_enqueue(
+        self, client: ScriptClient, stream_key: str, max_size: int, fields: Sequence[str]
+    ) -> str | None:
+        """Append a job; returns the entry id, or None if the queue is full."""
+        result: object = client.evalsha(
+            self._registry.get_sha("dispatch_enqueue"), 1, stream_key, max_size, *fields
+        )
+        return _to_optional_str(result)
+
+    async def dispatch_enqueue_async(
+        self, client: ScriptClient, stream_key: str, max_size: int, fields: Sequence[str]
+    ) -> str | None:
+        """Async variant of :meth:`dispatch_enqueue`."""
+        result: object = await client.aevalsha(
+            self._registry.get_sha("dispatch_enqueue"), 1, stream_key, max_size, *fields
+        )
+        return _to_optional_str(result)
+
+    def dispatch_status(
+        self, client: ScriptClient, stream_key: str, group: str
+    ) -> tuple[int, int, int]:
+        """Returns (length, in_progress, oldest_age_ms or -1)."""
+        result: object = client.evalsha(
+            self._registry.get_sha("dispatch_status"), 1, stream_key, group
+        )
+        values = _parse_int_list(result, 3)
+        return values[0], values[1], values[2]
+
+    async def dispatch_status_async(
+        self, client: ScriptClient, stream_key: str, group: str
+    ) -> tuple[int, int, int]:
+        """Async variant of :meth:`dispatch_status`."""
+        result: object = await client.aevalsha(
+            self._registry.get_sha("dispatch_status"), 1, stream_key, group
+        )
+        values = _parse_int_list(result, 3)
+        return values[0], values[1], values[2]
+
+
+def _to_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes | bytearray | memoryview):
+        return bytes(value).decode()
+    return str(value)
+
+
+def _flatten(rows: Sequence[tuple[int, ...]]) -> list[int]:
+    return [value for row in rows for value in row]
+
+
+def _parse_rate_acquire_result(result: object, n: int) -> tuple[bool, int, int, list[int]]:
+    if not isinstance(result, list | tuple) or len(result) != 3 + n:
+        raise ValueError("Unexpected rate_acquire result shape")
+
+    success = _to_bool(result[0])
+    retry_after_ms = _to_int(result[1])
+    now_ms = _to_int(result[2])
+    used = [_to_int(value) for value in result[3:]]
+    return success, retry_after_ms, now_ms, used
+
+
+def _parse_int_list(result: object, n: int) -> list[int]:
+    if not isinstance(result, list | tuple) or len(result) != n:
+        raise ValueError("Unexpected result shape")
+    return [_to_int(value) for value in result]
 
 
 def _parse_acquire_result(result: object) -> tuple[bool, int | None, int | None, int]:
