@@ -355,7 +355,11 @@ class DispatchQueue:
                     # BLMOVE back onto the same list reads without consuming:
                     # a reply lost in flight is still there for the retry.
                     reply = await self._client.blmove(
-                        reply_key, reply_key, timeout=block, src="RIGHT", dest="LEFT"
+                        reply_key,
+                        reply_key,
+                        timeout=block,  # type: ignore[arg-type]  # floats are fine
+                        src="RIGHT",
+                        dest="LEFT",
                     )
                 except (redis.RedisError, OSError) as exc:
                     failing_since = _tolerate_wait_error(exc, queue, failing_since)
@@ -402,7 +406,11 @@ class DispatchQueue:
                     # BLMOVE back onto the same list reads without consuming:
                     # a reply lost in flight is still there for the retry.
                     reply = self._client.blmove(
-                        reply_key, reply_key, timeout=block, src="RIGHT", dest="LEFT"
+                        reply_key,
+                        reply_key,
+                        timeout=block,  # type: ignore[arg-type]  # floats are fine
+                        src="RIGHT",
+                        dest="LEFT",
                     )
                 except (redis.RedisError, OSError) as exc:
                     failing_since = _tolerate_wait_error(exc, queue, failing_since)
@@ -913,7 +921,7 @@ class DispatchWorker:
                     async with self._claim_lock:
                         # Re-snapshot under the lock: entries handed back while
                         # we waited for it must not be touched again.
-                        current = list(ids)
+                        current: list[Any] = list(ids)
                         if not current:
                             continue
                         await self._client.xclaim(
@@ -1054,7 +1062,9 @@ class DispatchWorker:
         except Exception as exc:
             logger.warning("Worker %s: job %s failed", self.id, job.id, exc_info=True)
             # Keep the one structured detail waiters can act on.
-            data = {"retry_after": exc.retry_after} if isinstance(exc, RateLimitTimeoutError) else {}
+            data = {}
+            if isinstance(exc, RateLimitTimeoutError):
+                data = {"retry_after": exc.retry_after}
             reply = self._error_reply(exc, data)
             outcome = "failed"
         await self._finish(stream, job, reply)

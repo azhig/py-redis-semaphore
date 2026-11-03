@@ -755,7 +755,7 @@ async def test_redis_without_xautoclaim_stops_worker(async_redis_client, monkeyp
 
     monkeypatch.setattr(async_redis_client, "xautoclaim", no_xautoclaim)
     worker = DispatchWorker(async_redis_client, ["old-redis"], echo, _config())
-    with pytest.raises(CommandDeniedError, match="6.2"):
+    with pytest.raises(CommandDeniedError, match=r"6\.2"):
         await asyncio.wait_for(worker.run(), 10)
     assert worker.health().running is False
 
