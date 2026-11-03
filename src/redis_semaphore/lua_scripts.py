@@ -265,6 +265,11 @@ local function recount(log_key, total_key, ttl_ms)
         total = total + member_cost(member)
     end
     redis.call('SET', total_key, total, 'PX', ttl_ms)
+    local log_ttl = redis.call('PTTL', log_key)
+    if log_ttl > 0 then
+        -- The rebuilt total must not outlive the log it was derived from.
+        redis.call('PEXPIRE', total_key, log_ttl)
+    end
     return total
 end
 
@@ -368,8 +373,14 @@ for i = 1, n do
     local window_ms = tonumber(ARGV[base + 1])
     local cost = ARGV[base + 2]
     if tonumber(cost) > 0 then
-        redis.call('ZADD', log_key, now_ms, cost .. ':' .. identifier)
-        used[i] = redis.call('INCRBY', total_key, tonumber(cost))
+        -- NX + the guard keep a retried acquire (the client resent the script
+        -- after losing the reply) from charging the total twice: the member
+        -- is already recorded then, with its original admission time.
+        if redis.call('ZADD', log_key, 'NX', now_ms, cost .. ':' .. identifier) == 1 then
+            used[i] = redis.call('INCRBY', total_key, tonumber(cost))
+        else
+            used[i] = tonumber(redis.call('GET', total_key)) or used[i]
+        end
         touch(log_key, total_key, window_ms * 2)
     end
     result[3 + i] = used[i]

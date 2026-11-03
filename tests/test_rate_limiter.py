@@ -294,6 +294,19 @@ def test_retried_adjust_does_not_double_count(redis_client):
     assert int(redis_client.get(limiter.total_key("tokens"))) == 40
 
 
+def test_retried_acquire_does_not_double_count(redis_client):
+    """An acquire resent after a lost reply (client auto-retry) charges once."""
+    limiter = _limiter(redis_client, "acquire-retry", requests=10, tokens=100)
+    costs = {"requests": 1, "tokens": 30}
+    first = limiter._try_acquire(costs, "retry-me")
+    second = limiter._try_acquire(costs, "retry-me")  # the resent script call
+    assert first.success is True
+    assert second.success is True
+    assert limiter.status().usage["tokens"].used == 30
+    assert int(redis_client.get(limiter.total_key("tokens"))) == 30
+    assert redis_client.zcard(limiter.log_key("tokens")) == 1
+
+
 def test_retry_after_walks_past_first_chunk(redis_client):
     """retry_after is exact even when the freeing entry lies beyond 128 entries."""
     limiter = _limiter(redis_client, "retry-chunks", requests=1_000, tokens=300, window=5.0)
@@ -337,6 +350,18 @@ def test_adjust_rejects_invalid_permits(redis_client):
         other.adjust(permit, 0)
 
 
+def test_adjust_rejects_permit_of_another_limiter_with_same_limits(redis_client):
+    """Matching limit names ("requests", "tokens") must not fool adjust()."""
+    ours = _limiter(redis_client, "cert-1")
+    other = _limiter(redis_client, "cert-2")
+    permit = ours.acquire({"tokens": 10}, blocking=False)
+    with pytest.raises(ValueError, match="belongs"):
+        other.adjust(permit, {"tokens": 0})
+    # Nothing leaked into the other limiter's windows, ours kept its record.
+    assert other.status().usage["tokens"].used == 0
+    assert ours.status().usage["tokens"].used == 10
+
+
 # ---------------------------------------------------------------------------
 # Status & key hygiene
 # ---------------------------------------------------------------------------
@@ -378,6 +403,17 @@ def test_total_key_self_heals(redis_client):
     redis_client.set(limiter.total_key("tokens"), -7)
     assert limiter.status().usage["tokens"].used == 50
     assert redis_client.pttl(limiter.total_key("tokens")) > 0
+
+
+def test_rebuilt_total_does_not_outlive_log(redis_client):
+    limiter = _limiter(redis_client, "heal-ttl", requests=10, tokens=100, window=10.0)
+    limiter.acquire({"tokens": 30}, blocking=False)
+    redis_client.delete(limiter.total_key("tokens"))
+    assert limiter.status().usage["tokens"].used == 30
+    assert (
+        redis_client.pttl(limiter.total_key("tokens"))
+        <= redis_client.pttl(limiter.log_key("tokens")) + 100
+    )
 
 
 def test_expired_window_deletes_total(redis_client):

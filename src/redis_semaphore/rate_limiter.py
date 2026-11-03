@@ -92,6 +92,11 @@ class RateLimiter:
             return "{" + prefix + "}"
         return prefix
 
+    @property
+    def _scope(self) -> str:
+        """Identity stamped into permits, so adjust() rejects foreign ones."""
+        return f"{self._config.namespace}:{self._config.name}"
+
     def log_key(self, limit_name: str) -> str:
         """Redis key of the sorted-set log of one limit."""
         return f"{self._key_prefix}:{limit_name}:log"
@@ -146,8 +151,18 @@ class RateLimiter:
         """New per-limit costs for adjust; limits missing from a mapping keep theirs."""
         if not permit.success or permit.identifier is None or permit.acquired_at is None:
             raise ValueError("Only an admitted permit (success=True) can be adjusted")
+        if permit.limiter != self._scope:
+            # Limit names alone ("requests", "tokens") recur across limiters,
+            # so they cannot prove the permit is ours - the identity can.
+            raise ValueError(
+                f"Permit belongs to rate limiter '{permit.limiter}', "
+                f"not '{self._scope}'"
+            )
         if set(permit.costs) != {limit.name for limit in self._config.limits}:
-            raise ValueError(f"Permit does not belong to rate limiter '{self._config.name}'")
+            raise ValueError(
+                f"Permit does not match the limits of rate limiter '{self._config.name}' "
+                "(its configuration changed since the permit was issued)"
+            )
         if isinstance(cost, int):
             new_costs = dict.fromkeys(permit.costs, cost)
         else:
@@ -181,6 +196,7 @@ class RateLimiter:
                 acquired_at=now_ms / 1000,
                 retry_after=None,
                 used=used_by_name,
+                limiter=self._scope,
             )
         logger.debug(
             "Rate limiter '%s' full (used=%s, cost=%s); retry in %.3fs",
@@ -196,6 +212,7 @@ class RateLimiter:
             acquired_at=None,
             retry_after=retry_after_ms / 1000,
             used=used_by_name,
+            limiter=self._scope,
         )
 
     def _next_wait(self, permit: RatePermit, start: float) -> float:

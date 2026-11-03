@@ -307,6 +307,8 @@ class RatePermit:
             (computed atomically by Redis); None on success.
         used: Units consumed per limit within its window, as observed by the
             call (including this request on success).
+        limiter: Identity (``namespace:name``) of the limiter that issued the
+            permit; ``adjust()`` refuses permits of other limiters.
     """
 
     success: bool
@@ -315,6 +317,7 @@ class RatePermit:
     acquired_at: float | None
     retry_after: float | None
     used: dict[str, int] = field(default_factory=dict)
+    limiter: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
