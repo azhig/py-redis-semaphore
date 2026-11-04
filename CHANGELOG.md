@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-04
+
 ### Added
 
 - `RateLimiter`: distributed sliding-window rate limiter with weighted costs
@@ -52,6 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the server; `DispatchWorker.health()` returns a local `WorkerHealth`
   (running, leading, jobs_in_progress, last_loop_age, last Redis error,
   `healthy` for readiness probes)
+
+### Fixed
+
+- `Semaphore`/`Mutex`: a blocking `acquire()` / `aacquire()` in BLPOP mode no
+  longer aborts with `CommandDeniedError` when Redis interrupts the wait with
+  an `UNBLOCKED` error (e.g. the master being demoted to a replica during a
+  Sentinel failover, or `CLIENT UNBLOCK ... ERROR`): `UNBLOCKED` now maps to
+  the transient `RedisConnectionError`, so the wait counts as a spurious
+  wakeup and the acquire loop retries
+- BLPOP waits shorter than 10 ms are clamped up to 10 ms and skipped only
+  when the acquire deadline itself is less than 10 ms away. Redis before 7.0
+  truncates sub-millisecond blocking timeouts to 0 ("block forever"), so a
+  blocking `acquire()` that reached the wait with under 1 ms left could block
+  far past `acquire_timeout` (until the next release or the client
+  `socket_timeout`)
 
 ## [0.2.0] - 2026-08-10
 
@@ -167,3 +184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomic operations via Lua scripts
 - `py.typed` marker for PEP 561 compliance
 - Python 3.10+ support
+
+[Unreleased]: https://github.com/azhig/py-redis-semaphore/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/azhig/py-redis-semaphore/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/azhig/py-redis-semaphore/releases/tag/v0.2.0
